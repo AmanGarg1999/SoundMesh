@@ -12,6 +12,7 @@ import { initWaveformViz } from './waveformViz.js';
 import { renderPlacementGrid } from './placementGrid.js';
 import { renderSyncMonitor } from './syncMonitor.js';
 import { getPlatformIcon } from '../utils/helpers.js';
+import { youtubeUI } from './youtubeUI.js';
 
 let waveformCleanup = null;
 let statsInterval = null;
@@ -48,13 +49,16 @@ export function renderHostDashboard() {
                   🖥️ Capture System Audio
                 </button>
                 <div class="source-alt-row">
+                  <button class="btn btn-secondary" id="btn-youtube">
+                    📺 YouTube
+                  </button>
                   <button class="btn btn-secondary" id="btn-file-upload">
                     📁 Upload File
                   </button>
-                  <button class="btn btn-secondary" id="btn-mic">
-                    🎤 Microphone
-                  </button>
                 </div>
+                <button class="btn btn-ghost btn-sm" id="btn-mic" style="margin-top: 4px;">
+                  🎤 Open Microphone
+                </button>
                 <input type="file" id="file-input" accept="audio/*" style="display: none;">
                 <p class="text-xs text-secondary" style="margin-top: 8px; text-align: center;">
                   System Audio captures everything playing — Spotify, YouTube, games, anything
@@ -308,6 +312,9 @@ export function renderHostDashboard() {
     </style>
   `;
 
+  // ── Render YouTube UI ──
+  youtubeUI.render();
+
   // ── Bind Events ──
   bindHostEvents();
 
@@ -394,6 +401,14 @@ function bindHostEvents() {
       wsClient.send('playback_state', { isPlaying: true, source: 'system' });
     } catch (err) {
       showToast('Failed to capture audio. Make sure to check "Share audio" when sharing your screen.', 'error');
+    }
+  });
+
+  // YouTube
+  document.getElementById('btn-youtube')?.addEventListener('click', () => {
+    youtubeUI.toggleModal(true);
+    if (!audioCapture.isCapturing) {
+      showToast('Tip: Use "System Audio Capture" to stream YouTube audio to nodes.', 'info');
     }
   });
 

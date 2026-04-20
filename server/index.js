@@ -11,6 +11,9 @@ import { SessionManager } from './sessionManager.js';
 import { ClockSyncMaster } from './clockSync.js';
 import { AudioRelay } from './audioRelay.js';
 import { DeviceRegistry } from './deviceRegistry.js';
+import { youtubeHandler } from './youtubeHandler.js';
+import session from 'express-session';
+import cookieParser from 'cookie-parser';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isProduction = process.argv.includes('--production');
@@ -18,6 +21,14 @@ const PORT = process.env.PORT || 3000;
 
 // ── Express App ──
 const app = express();
+app.use(express.json());
+app.use(cookieParser());
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'soundmesh-super-secret',
+  resave: false,
+  saveUninitialized: true,
+  cookie: { secure: isSSL }
+}));
 // ── SSL Configuration ──
 const certPaths = {
   key: process.env.SSL_KEY || path.join(__dirname, '../certs/server.key'),
@@ -74,6 +85,75 @@ app.get('/api/connection-info', (req, res) => {
     isSSL,
     session: sessionManager.getSessionInfo(),
   });
+});
+
+// ── YouTube API Endpoints ──
+
+// Search
+app.get('/api/youtube/search', async (req, res) => {
+  try {
+    const results = await youtubeHandler.search(req.query.q);
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Video Metadata
+app.get('/api/youtube/video/:id', async (req, res) => {
+  try {
+    const metadata = await youtubeHandler.getVideoMetadata(req.params.id);
+    res.json(metadata);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// OAuth Login
+app.get('/auth/youtube', (req, res) => {
+  try {
+    const url = youtubeHandler.getAuthUrl();
+    res.redirect(url);
+  } catch (err) {
+    res.status(500).send('OAuth configuration error: ' + err.message);
+  }
+});
+
+// OAuth Callback
+app.get('/auth/youtube/callback', async (req, res) => {
+  const { code } = req.query;
+  try {
+    const tokens = await youtubeHandler.handleCallback(code);
+    req.session.youtubeTokens = tokens;
+    // Redirect back to app
+    res.redirect('/');
+  } catch (err) {
+    res.status(500).send('OAuth authentication failed: ' + err.message);
+  }
+});
+
+// Personal Playlists
+app.get('/api/youtube/playlists', async (req, res) => {
+  if (!req.session.youtubeTokens) {
+    return res.status(401).json({ error: 'Not authenticated with YouTube' });
+  }
+  try {
+    const playlists = await youtubeHandler.getPersonalPlaylists(req.session.youtubeTokens.access_token);
+    res.json(playlists);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Playlist Items
+app.get('/api/youtube/playlist/:id/items', async (req, res) => {
+  const accessToken = req.session.youtubeTokens ? req.session.youtubeTokens.access_token : null;
+  try {
+    const items = await youtubeHandler.getPlaylistItems(req.params.id, accessToken);
+    res.json(items);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── WebSocket Server ──

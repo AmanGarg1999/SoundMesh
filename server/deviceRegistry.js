@@ -13,6 +13,16 @@ export class DeviceRegistry {
    * Register a new or existing device connection
    */
   register(ws, info) {
+    // SECURITY/BUGFIX: If this WebSocket is already registered to a different deviceId,
+    // unregister the old one FIRST. This prevents a single tab from showing up as 
+    // multiple devices if it double-registers or refreshes with a new ID.
+    for (const [id, socket] of this.wsMap.entries()) {
+      if (socket === ws && id !== info.deviceId) {
+        console.log(`[DeviceRegistry] Cleaning up stale registration for device: ${id}`);
+        this.unregister(id);
+      }
+    }
+
     let deviceId = info.deviceId;
     let isReconnection = false;
 
