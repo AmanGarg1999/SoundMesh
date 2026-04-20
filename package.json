@@ -1,0 +1,21 @@
+{
+  "name": "soundmesh",
+  "version": "1.0.0",
+  "description": "Distributed Bluetooth Audio — Turn every device into a synchronized speaker",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"node server/index.js\" \"vite\"",
+    "build": "vite build",
+    "start": "node server/index.js --production",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "uuid": "^10.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1",
+    "vite": "^5.4.0"
+  }
+}
