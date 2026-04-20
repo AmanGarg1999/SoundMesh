@@ -15,6 +15,7 @@ import {
   PI_INTEGRAL_MAX,
   PLAYBACK_RATE_ADJUST,
 } from '../utils/constants.js';
+import { insomnia } from '../utils/insomnia.js';
 
 class AudioPlayer extends EventEmitter {
   constructor() {
@@ -28,7 +29,8 @@ class AudioPlayer extends EventEmitter {
     this.muted = false;
 
     // Scheduling state
-    this.nextScheduledTime = 0;    this.outputLatency = 0.04; // 40ms default
+    this.nextScheduledTime = 0;
+    this.outputLatency = 0.04; // 40ms default
     this.localDelayOffset = 0; // Dynamic fallback buffer for slow networks
     this.schedulerInterval = null;
     this.chunksPlayed = 0;
@@ -42,6 +44,13 @@ class AudioPlayer extends EventEmitter {
     this.schedulerWorker = null;
     this.mediaStreamDestination = null;
     this.tetherAudio = null;
+
+    // Multi-Output Support
+    this.enabledSinkIds = new Set(JSON.parse(localStorage.getItem('soundmesh_enabled_sinks') || '["default"]'));
+    this.activeSinks = new Map();     // deviceId -> <audio> element
+    this.sinkDelayNodes = new Map(); // deviceId -> DelayNode
+    this.sinkDestinations = new Map(); // deviceId -> MediaStreamDestination
+    this.sinkOffsets = new Map(Object.entries(JSON.parse(localStorage.getItem('soundmesh_sink_offsets') || '{}')));
 
     // Stats
     this.syncDrift = 0;
@@ -71,16 +80,16 @@ class AudioPlayer extends EventEmitter {
     this.analyserNode.fftSize = 2048;
     this.analyserNode.connect(this.gainNode);
 
-    // [Sync v2.7] Tethering Logic
-    if (this.audioContext.createMediaStreamDestination) {
-      this.mediaStreamDestination = this.audioContext.createMediaStreamDestination();
-      this.gainNode.connect(this.mediaStreamDestination);
-      // We do NOT connect to audioContext.destination here!
-      // The <audio> tether will handle the speaker output exclusively on iOS.
-      console.log('[AudioPlayer] Exclusive tether destination created');
-    } else {
-      this.gainNode.connect(this.audioContext.destination);
-    }
+    // [Sync v3.1] Each output device now gets its own subgraph connected to GainNode
+    // This allows us to apply a custom delay to every physical device (internal vs BT)
+    console.log('[AudioPlayer] Ready for multi-sink routing');
+
+    // [Reliability] Clock Anchor: Create a silent tether to the hardware destination
+    // This prevents the browser from putting the audio graph to sleep (keep-alive)
+    const anchor = this.audioContext.createGain();
+    anchor.gain.value = 0;
+    this.gainNode.connect(anchor);
+    anchor.connect(this.audioContext.destination);
 
     // Measure output latency
     this.outputLatency = this.audioContext.outputLatency || 0;
@@ -89,6 +98,197 @@ class AudioPlayer extends EventEmitter {
     }
 
     console.log(`[AudioPlayer] Initialized. Output latency: ${(this.outputLatency * 1000).toFixed(1)}ms`);
+  }
+
+  /**
+   * Enumerate all available audio output devices
+   */
+  async enumerateAvailableOutputs() {
+    try {
+      if (!navigator.mediaDevices) {
+        return [{ deviceId: 'default', label: 'Default Speaker' }];
+      }
+
+      // [2026 Update] Use selectAudioOutput if supported (best for Mobile)
+      if (typeof navigator.mediaDevices.selectAudioOutput === 'function') {
+        // We don't call it here (it's a prompt), but we check for it
+        console.log('[AudioPlayer] selectAudioOutput API available');
+      }
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const outputs = devices.filter(d => d.kind === 'audiooutput');
+      
+      return outputs.map(d => ({
+        deviceId: d.deviceId,
+        label: d.label || (d.deviceId === 'default' ? 'System Default' : `Output Device ${d.deviceId.slice(0, 4)}`),
+        kind: d.kind,
+      }));
+    } catch (err) {
+      console.error('[AudioPlayer] Failed to enumerate devices:', err);
+      return [{ deviceId: 'default', label: 'System Default' }];
+    }
+  }
+
+  /**
+   * Specifically trigger the browser's native device selector (if available)
+   */
+  async requestOutputSelection() {
+    if (navigator.mediaDevices && typeof navigator.mediaDevices.selectAudioOutput === 'function') {
+      try {
+        const device = await navigator.mediaDevices.selectAudioOutput();
+        if (device) {
+          await this.setSinkEnabled(device.deviceId, true);
+          return device.deviceId;
+        }
+      } catch (err) {
+        console.warn('[AudioPlayer] Native selection failed/cancelled:', err);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Update active <audio> sinks based on enabledSinkIds
+   */
+  async updateSinks() {
+    if (!this.audioContext) return;
+
+    // Identify which sinks to add and which to remove
+    const currentActiveIds = Array.from(this.activeSinks.keys());
+    const targetIds = Array.from(this.enabledSinkIds);
+
+    // Remove sinks that are no longer enabled
+    for (const id of currentActiveIds) {
+      if (!this.enabledSinkIds.has(id)) {
+        const audio = this.activeSinks.get(id);
+        const delay = this.sinkDelayNodes.get(id);
+        const dest = this.sinkDestinations.get(id);
+
+        if (audio) {
+          audio.pause();
+          audio.srcObject = null;
+          try {
+            if (audio.parentNode) audio.parentNode.removeChild(audio);
+          } catch (e) {}
+        }
+        if (delay) delay.disconnect();
+        if (dest) dest.disconnect();
+
+        this.activeSinks.delete(id);
+        this.sinkDelayNodes.delete(id);
+        this.sinkDestinations.delete(id);
+        console.log(`[AudioPlayer] Removed sink path: ${id}`);
+      }
+    }
+
+    // Add new sinks
+    for (const id of targetIds) {
+      if (!this.activeSinks.has(id)) {
+        try {
+          // 1. Create Delay Node for this specific sink
+          const delayNode = this.audioContext.createDelay(5.0); // Expanded to 5s for reliability
+          const offset = this.getSinkDelay(id) / 1000; // ms to s
+          delayNode.delayTime.setValueAtTime(offset, this.audioContext.currentTime);
+          
+          // 2. Create Destination
+          const dest = this.audioContext.createMediaStreamDestination();
+          
+          // 3. Connect subgraph: Gain -> Delay -> Dest
+          this.gainNode.connect(delayNode);
+          delayNode.connect(dest);
+          
+          // 4. Create Audio element
+          const audio = new Audio();
+          audio.id = `soundmesh-sink-${id}`;
+          audio.autoplay = true;
+          audio.playsInline = true;
+          audio.style.display = 'none'; // DOM residency but hidden
+          audio.srcObject = dest.stream;
+          
+          // [Security] Must be in DOM for some browsers to play MediaStream
+          document.body.appendChild(audio);
+          
+          if (id !== 'default' && 'setSinkId' in audio) {
+            await audio.setSinkId(id).catch(e => console.warn(`[AudioPlayer] setSinkId failed for ${id}:`, e));
+          }
+          
+          await audio.play().catch(e => console.warn(`[AudioPlayer] Play failed for ${id}:`, e));
+
+          this.activeSinks.set(id, audio);
+          this.sinkDelayNodes.set(id, delayNode);
+          this.sinkDestinations.set(id, dest);
+          console.log(`[AudioPlayer] Path active: ${id}`);
+        } catch (err) {
+          console.error(`[AudioPlayer] Error creating path for sink ${id}:`, err);
+        }
+      }
+    }
+
+    // Apply normalized delays across all current nodes
+    this.applyRelativeDelays();
+
+    // Persistence
+    localStorage.setItem('soundmesh_enabled_sinks', JSON.stringify(Array.from(this.enabledSinkIds)));
+  }
+
+  /**
+   * Set latency compensation for a specific sink
+   */
+  setSinkDelay(sinkId, ms) {
+    this.sinkOffsets.set(sinkId, ms);
+    this.applyRelativeDelays();
+    
+    // Persist
+    const obj = Object.fromEntries(this.sinkOffsets);
+    localStorage.setItem('soundmesh_sink_offsets', JSON.stringify(obj));
+  }
+
+  /**
+   * Normalize all offsets so the 'fastest' device has 0ms physical delay
+   */
+  applyRelativeDelays() {
+    if (!this.audioContext) return;
+
+    // We only care about offsets for enabled sinks
+    const enabledOffsets = Array.from(this.enabledSinkIds)
+      .map(id => this.sinkOffsets.get(id) || 0);
+    
+    if (enabledOffsets.length === 0) return;
+
+    // Find the minimum nudge value
+    const minOffset = Math.min(...enabledOffsets);
+
+    // Apply normalized delays: physicalDelay = nudge - minNudge
+    for (const [id, node] of this.sinkDelayNodes.entries()) {
+      if (this.enabledSinkIds.has(id)) {
+        const nudge = this.sinkOffsets.get(id) || 0;
+        const physicalDelayS = (nudge - minOffset) / 1000;
+        node.delayTime.setTargetAtTime(physicalDelayS, this.audioContext.currentTime, 0.1);
+      }
+    }
+  }
+
+  getSinkDelay(sinkId) {
+    return this.sinkOffsets.get(sinkId) || 0;
+  }
+
+  /**
+   * Toggle a specific sink
+   */
+  async setSinkEnabled(sinkId, isEnabled) {
+    if (isEnabled) {
+      this.enabledSinkIds.add(sinkId);
+    } else {
+      // Don't allow disabling "default" if it's the last one? 
+      // Actually, user can mute if they want.
+      this.enabledSinkIds.delete(sinkId);
+    }
+    
+    if (this.isPlaying) {
+      await this.updateSinks();
+    } else {
+      localStorage.setItem('soundmesh_enabled_sinks', JSON.stringify(Array.from(this.enabledSinkIds)));
+    }
   }
 
   /**
@@ -208,27 +408,14 @@ class AudioPlayer extends EventEmitter {
     this.initBackgroundAudio();
     this.setupMediaSession();
 
-    // [Sync v2.7] Activate iOS stream tethering
-    if (this.mediaStreamDestination) {
-      if (!this.tetherAudio) {
-        this.tetherAudio = new Audio();
-        this.tetherAudio.id = 'ios-background-tether';
-        this.tetherAudio.muted = false; // Must be unmuted but our stream is volume-controlled
-        this.tetherAudio.playsInline = true;
-      }
-      this.tetherAudio.srcObject = this.mediaStreamDestination.stream;
-      this.tetherAudio.play().catch(e => console.warn('[AudioPlayer] Tether failed:', e));
-    }
+    // [Sync v3.0] Activate all enabled output sinks
+    await this.updateSinks();
+
+    // [Insomnia] Activate high-priority sleep prevention
+    await insomnia.activate();
 
     // Request screen wake lock
-    if ('wakeLock' in navigator) {
-      try {
-        this.wakeLock = await navigator.wakeLock.request('screen');
-        console.log('[AudioPlayer] Wake Lock active');
-      } catch (err) {
-        console.warn('[AudioPlayer] Wake Lock failed:', err);
-      }
-    }
+    // Handled by insomnia.activate()
 
     console.log('[AudioPlayer] Started');
     this.emit('playback_started');
@@ -258,8 +445,19 @@ class AudioPlayer extends EventEmitter {
     this.nextScheduledTime = 0;
 
     if (this.wakeLock) {
-      this.wakeLock.release().then(() => { this.wakeLock = null; });
+      insomnia.deactivate();
+      this.wakeLock = null;
     }
+
+    // Deactivate all physical sinks or remove them from DOM
+    for (const audio of this.activeSinks.values()) {
+      audio.pause();
+      audio.srcObject = null;
+      try {
+        if (audio.parentNode) audio.parentNode.removeChild(audio);
+      } catch (e) {}
+    }
+    this.activeSinks.clear();
 
     console.log(`[AudioPlayer] Stopped. Played ${this.chunksPlayed} chunks`);
     this.emit('playback_stopped');
@@ -556,8 +754,12 @@ class AudioPlayer extends EventEmitter {
     gain.gain.setValueAtTime(0, this.audioContext.currentTime);
     gain.gain.linearRampToValueAtTime(0.2, this.audioContext.currentTime + 0.1);
     gain.gain.linearRampToValueAtTime(0, this.audioContext.currentTime + 0.5);
-
+    
+    // Connect through the standard multi-sink pipeline
     osc.connect(gain);
+    gain.connect(this.analyserNode);
+
+    // Also connect to destination for direct feedback
     gain.connect(this.audioContext.destination);
 
     osc.start();
@@ -589,6 +791,7 @@ class AudioPlayer extends EventEmitter {
         if (this.backgroundAudio.paused) {
           this.backgroundAudio.play().catch(() => {});
         }
+        insomnia.activate(); // Re-sync locks
       }
     });
 

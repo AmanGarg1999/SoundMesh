@@ -23,12 +23,6 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'soundmesh-super-secret',
-  resave: false,
-  saveUninitialized: true,
-  cookie: { secure: isSSL }
-}));
 // ── SSL Configuration ──
 const certPaths = {
   key: process.env.SSL_KEY || path.join(__dirname, '../certs/server.key'),
@@ -57,6 +51,13 @@ try {
   console.error('[SoundMesh] Failed to initialize SSL. Falling back to HTTP.', err.message);
   server = createHttpServer(app);
 }
+
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'soundmesh-super-secret',
+  resave: false,
+  saveUninitialized: true,
+  cookie: { secure: isSSL }
+}));
 
 // Serve static files in production
 if (isProduction) {
@@ -207,6 +208,9 @@ wss.on('connection', (ws, req) => {
             userAgent: req.headers['user-agent'],
           });
 
+          // Attach ID to socket for reliable cleanup
+          ws.deviceId = deviceId;
+
           const device = deviceRegistry.getDevice(deviceId);
           console.log(`[SoundMesh] Registered device: ${deviceId} as ${device.role}`);
 
@@ -253,14 +257,7 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    // Find deviceId for this socket
-    let currentDeviceId = null;
-    for (const [id, socket] of deviceRegistry.wsMap.entries()) {
-      if (socket === ws) {
-        currentDeviceId = id;
-        break;
-      }
-    }
+    const currentDeviceId = ws.deviceId;
 
     if (currentDeviceId) {
       console.log(`[SoundMesh] Device disconnected: ${currentDeviceId}`);

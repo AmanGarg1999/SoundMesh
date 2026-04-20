@@ -2,10 +2,10 @@
 // Captures ALL audio playing on the host device using getDisplayMedia
 // Also supports file upload and microphone input as fallback sources
 
-import { EventEmitter } from '../utils/helpers.js';
+import { EventEmitter, float32ToInt16 } from '../utils/helpers.js';
 import { SAMPLE_RATE, CHANNELS, SAMPLES_PER_CHUNK, CHUNK_DURATION_MS } from '../utils/constants.js';
-import { float32ToInt16 } from '../utils/helpers.js';
 import { clockSync } from './clockSync.js';
+import { insomnia } from '../utils/insomnia.js';
 
 class AudioCapture extends EventEmitter {
   constructor() {
@@ -97,6 +97,7 @@ class AudioCapture extends EventEmitter {
 
       console.log('[AudioCapture] System audio capture started');
       this.emit('capture_started', { source: 'system' });
+      insomnia.activate();
 
     } catch (err) {
       console.error('[AudioCapture] Failed to capture system audio:', err);
@@ -135,6 +136,7 @@ class AudioCapture extends EventEmitter {
 
       console.log('[AudioCapture] Microphone capture started');
       this.emit('capture_started', { source: 'microphone' });
+      insomnia.activate();
 
     } catch (err) {
       console.error('[AudioCapture] Mic capture failed:', err);
@@ -183,6 +185,7 @@ class AudioCapture extends EventEmitter {
       this.sequenceNumber = 0;
 
       console.log('[AudioCapture] File playback started:', file.name);
+      insomnia.activate();
       this.emit('capture_started', {
         source: 'file',
         fileName: file.name,
@@ -249,6 +252,7 @@ class AudioCapture extends EventEmitter {
    */
   stop() {
     this.isCapturing = false;
+    insomnia.deactivate();
 
     if (this.fileSourceNode) {
       try { this.fileSourceNode.stop(); } catch (e) {}

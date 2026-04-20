@@ -321,23 +321,29 @@ export function renderHostDashboard() {
   // ── Fetch connection info ──
   fetchConnectionInfo();
 
-  // ── Start sync monitor ──
+  // ── Sync monitor ──
   renderSyncMonitor(document.getElementById('sync-canvas'));
-
-  // ── Device list updates ──
-  document.addEventListener('devices-updated', (e) => {
-    const list = document.getElementById('device-list');
-    const badge = document.getElementById('device-count-badge');
-    const count = document.getElementById('device-count');
-    if (list) list.innerHTML = renderDeviceList();
-    if (badge) badge.textContent = appState.devices.length;
-    if (count) count.textContent = appState.devices.length;
-  });
 
   // ── Stats update interval ──
   if (statsInterval) clearInterval(statsInterval);
   statsInterval = setInterval(updateStats, 1000);
 }
+
+/**
+ * Handle device list updates with proper listener cleanup to avoid duplicates
+ */
+function handleDeviceUpdate() {
+  const list = document.getElementById('device-list');
+  const badge = document.getElementById('device-count-badge');
+  const count = document.getElementById('device-count');
+  if (list) list.innerHTML = renderDeviceList();
+  if (badge) badge.textContent = appState.devices.length;
+  if (count) count.textContent = appState.devices.length;
+}
+
+// Global listener cleanup strategy
+document.removeEventListener('devices-updated', handleDeviceUpdate);
+document.addEventListener('devices-updated', handleDeviceUpdate);
 
 function renderDeviceList() {
   if (appState.devices.length === 0) {

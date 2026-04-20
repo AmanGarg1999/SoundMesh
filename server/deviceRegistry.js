@@ -13,19 +13,30 @@ export class DeviceRegistry {
    * Register a new or existing device connection
    */
   register(ws, info) {
-    // SECURITY/BUGFIX: If this WebSocket is already registered to a different deviceId,
-    // unregister the old one FIRST. This prevents a single tab from showing up as 
-    // multiple devices if it double-registers or refreshes with a new ID.
+    let deviceId = info.deviceId;
+
+    // SECURITY/BUGFIX: If this deviceId is already associated with an active socket,
+    // we must close the old one to prevent duplicates and phasing issues in audio.
+    if (deviceId && this.wsMap.has(deviceId)) {
+      const oldWs = this.wsMap.get(deviceId);
+      if (oldWs && oldWs !== ws && oldWs.readyState === 1 /* OPEN */) {
+        console.log(`[DeviceRegistry] Terminating stale socket for device: ${deviceId}`);
+        // Ensure the old socket doesn't trigger a 'device_left' broadcast that 
+        // might conflict with this new 'device_joined'
+        oldWs.deviceId = null; 
+        oldWs.terminate();
+      }
+    }
+
+    // Secondary cleanup: If this WebSocket is somehow already registered to a different deviceId
     for (const [id, socket] of this.wsMap.entries()) {
-      if (socket === ws && id !== info.deviceId) {
-        console.log(`[DeviceRegistry] Cleaning up stale registration for device: ${id}`);
+      if (socket === ws && id !== deviceId) {
+        console.log(`[DeviceRegistry] Cleaning up mismatched registration for device: ${id}`);
         this.unregister(id);
       }
     }
 
-    let deviceId = info.deviceId;
     let isReconnection = false;
-
     // If deviceId provided and exists, handle as reconnection
     if (deviceId && this.devices.has(deviceId)) {
       console.log(`[DeviceRegistry] Reconnection for existing device: ${deviceId}`);
@@ -35,19 +46,21 @@ export class DeviceRegistry {
       deviceId = info.deviceId || uuidv4().slice(0, 8);
     }
 
-    // Role detection: prioritize roleIntent if it comes from localhost, 
-    // otherwise check if the Referer is localhost
+    // Role detection
     let role;
     if (isReconnection && this.devices.has(deviceId)) {
-      role = this.devices.get(deviceId).role; // Keep existing role across disconnects
+      role = this.devices.get(deviceId).role;
     } else {
       role = info.roleIntent || (info.isLocalhost ? 'host' : 'node');
-      if (role === 'host') {
-        const existingHost = this.getHost();
-        if (existingHost && existingHost.deviceId !== deviceId) {
-          console.warn(`[DeviceRegistry] Host already exists (${existingHost.deviceId}). Downgrading new connection ${deviceId} to node.`);
-          role = 'node';
-        }
+    }
+
+    // MANDATORY GLOBAL CHECK: Ensure only one host exists, even on reconnection.
+    // If this device claims to be host but one is already active, downgrade it.
+    if (role === 'host') {
+      const activeHost = this.getHost();
+      if (activeHost && activeHost.deviceId !== deviceId) {
+        console.warn(`[DeviceRegistry] Role conflict for ${deviceId}. Another host is already active. Enforcing Node mode.`);
+        role = 'node';
       }
     }
 
@@ -59,7 +72,6 @@ export class DeviceRegistry {
       isLocalhost: info.isLocalhost,
       userAgent: info.userAgent,
       platform: this.detectPlatform(info.userAgent),
-      // Audio config
       outputMode: 'builtin', 
       volume: 1.0,
       muted: false,

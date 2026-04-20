@@ -24,6 +24,7 @@ class ClockSync extends EventEmitter {
     
     this.minRtt = Infinity;
     this.lastSyncTime = 0;     // Local time of last valid sync
+    this.consecutiveRejectedPings = 0;
     
     this.globalBuffer = DEFAULT_GLOBAL_BUFFER;
     this.syncStatus = 'unknown';
@@ -73,12 +74,18 @@ class ClockSync extends EventEmitter {
     const rtt = clientReceiveTime - clientSendTime;
     const offset = ((serverReceiveTime - clientSendTime) + (serverSendTime - clientReceiveTime)) / 2;
 
-    // ── Minimum RTT Filter (Golden Sample Logic) ──
+    // ── Adaptive RTT & Golden Sample Logic ──
+    // Slowly relax our minimum RTT so we can adapt if the network permanently degrades
+    if (this.minRtt !== Infinity) {
+      this.minRtt += 0.5; 
+    }
+
     // We only update our base offset if this RTT is within a reasonable range of our best seen
-    // This filters out asymmetric Wi-Fi jitter
-    if (rtt < this.minRtt * 1.5 || this.minRtt === Infinity) {
+    // OR if we've been starved of valid pings for too long (Safety Fallback)
+    if (rtt < this.minRtt * 1.5 || this.minRtt === Infinity || this.consecutiveRejectedPings >= 5) {
       if (rtt < this.minRtt) this.minRtt = rtt;
       
+      this.consecutiveRejectedPings = 0;
       this.offsetSamples.push(offset);
       this.history.push({ t: clientReceiveTime, offset });
       this.lastSyncTime = clientReceiveTime;
@@ -87,6 +94,8 @@ class ClockSync extends EventEmitter {
       if (this.history.length > SKEW_WINDOW_SIZE) this.history.shift();
 
       this.estimateSkew();
+    } else {
+      this.consecutiveRejectedPings++;
     }
 
     this.rttSamples.push(rtt);
@@ -149,7 +158,12 @@ class ClockSync extends EventEmitter {
     if (denominator === 0) return;
 
     // skew is the gradient (ms of offset change per ms of local time)
-    this.skew = (n * sumXY - sumX * sumY) / denominator;
+    let rawSkew = (n * sumXY - sumX * sumY) / denominator;
+    
+    // ── Physical Clamping ──
+    // A standard hardware crystal oscillator rarely deviates by more than 500 parts per million.
+    // We clamp the skew to ±0.0005 to prevent catastrophic prediction errors during heavy network jitter.
+    this.skew = Math.max(-0.0005, Math.min(0.0005, rawSkew));
     
     // We don't update baseOffset here because this.offset is updated by averaging
     // the most recent Golden Samples in handlePong.

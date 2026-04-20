@@ -56,6 +56,9 @@ function init() {
     const idx = appState.devices.findIndex(d => d.deviceId === device.deviceId);
     if (idx === -1) {
       appState.devices.push(device);
+    } else {
+      // Deep update existing device to ensure UI reflects any changed state (IP, etc)
+      Object.assign(appState.devices[idx], device);
     }
     refreshUI();
   });
