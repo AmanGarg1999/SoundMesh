@@ -7,6 +7,8 @@ export class DeviceRegistry {
   constructor() {
     this.devices = new Map(); // deviceId → deviceInfo
     this.wsMap = new Map();   // deviceId → WebSocket
+    this.roomPin = Math.floor(1000 + Math.random() * 9000).toString();
+    console.log(`[DeviceRegistry] Security PIN initialized: ${this.roomPin}`);
   }
 
   /**
@@ -20,9 +22,7 @@ export class DeviceRegistry {
     if (deviceId && this.wsMap.has(deviceId)) {
       const oldWs = this.wsMap.get(deviceId);
       if (oldWs && oldWs !== ws && oldWs.readyState === 1 /* OPEN */) {
-        console.log(`[DeviceRegistry] Terminating stale socket for device: ${deviceId}`);
-        // Ensure the old socket doesn't trigger a 'device_left' broadcast that 
-        // might conflict with this new 'device_joined'
+        // Quietly terminate old socket to avoid UI noise during reconnections
         oldWs.deviceId = null; 
         oldWs.terminate();
       }
@@ -59,10 +59,18 @@ export class DeviceRegistry {
     if (role === 'host') {
       const activeHost = this.getHost();
       if (activeHost && activeHost.deviceId !== deviceId) {
-        console.warn(`[DeviceRegistry] Role conflict for ${deviceId}. Another host is already active. Enforcing Node mode.`);
+        console.warn(`[DeviceRegistry] Role Conflict: Device ${deviceId} attempted to join as 'host', but ${activeHost.deviceId} is already active. Downgrading to 'node'.`);
         role = 'node';
       }
     }
+
+    // Security check: Validate PIN for Nodes
+    /* 
+    if (role === 'node' && info.pin !== this.roomPin) {
+      console.warn(`[DeviceRegistry] Rejected device ${deviceId}: Invalid Room PIN.`);
+      return { error: 'invalid_pin' };
+    }
+    */
 
     const device = isReconnection ? this.devices.get(deviceId) : {
       deviceId,

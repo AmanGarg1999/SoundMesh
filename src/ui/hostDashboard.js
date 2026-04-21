@@ -115,6 +115,14 @@ export function renderHostDashboard() {
                     </button>
                   </div>
                 </div>
+                <!--
+                <div class="session-url" style="margin-top: 12px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 12px;">
+                  <span class="text-xs text-secondary">Room PIN (Required for Nodes):</span>
+                  <div style="text-align: center; margin-top: 4px;">
+                    <code id="room-pin" style="font-size: 1.8em; letter-spacing: 4px; font-weight: bold; background: rgba(0,0,0,0.2); padding: 8px 16px; border-radius: var(--radius-sm); color: var(--accent-primary);">${appState.session?.pin || '----'}</code>
+                  </div>
+                </div>
+                -->
                 <div class="session-stats">
                   <div class="stat-item">
                     <span class="stat-value" id="device-count">${appState.devices.length}</span>
@@ -367,6 +375,7 @@ function renderDeviceList() {
         <div class="device-card-info">
           <div class="device-card-name">
             ${device.name} ${isHost ? '<span class="badge badge-primary" style="font-size:10px;">HOST</span>' : ''}
+            ${device.isCalibrating ? '<span class="badge badge-warning pulsate" style="font-size:10px; margin-left:5px;">TESTING...</span>' : ''}
           </div>
           <div class="device-card-meta">
             <span class="status-dot status-dot--${syncClass}"></span>
@@ -516,15 +525,46 @@ function bindHostEvents() {
     renderPlacementGrid();
   });
 
-  // AuraSync Auto-Cal
+  // AuraSync Auto-Cal (Sequential)
   const btnAutoCal = document.getElementById('btn-auto-cal');
-  btnAutoCal?.addEventListener('click', () => {
+  btnAutoCal?.addEventListener('click', async () => {
     if (!audioStreamer.isStreaming) {
       showToast('Start audio source first!', 'error');
       return;
     }
-    // Global sync = targetDeviceId is null
-    acousticSync.startHostCalibration(null);
+    
+    const nodes = appState.devices.filter(d => d.role === 'node');
+    if (nodes.length === 0) {
+      showToast('No nodes connected to calibrate.', 'warning');
+      return;
+    }
+
+    btnAutoCal.disabled = true;
+
+    for (let i = 0; i < nodes.length; i++) {
+       const node = nodes[i];
+       showToast(`Calibrating node ${i+1}/${nodes.length}: ${node.name}`, 'info');
+       
+       // Mark node as calibrating in state
+       node.isCalibrating = true;
+       handleDeviceUpdate(); 
+
+       await new Promise(resolve => {
+         const onFinished = () => {
+           acousticSync.off('host_cal_finished', onFinished);
+           node.isCalibrating = false;
+           handleDeviceUpdate();
+           resolve();
+         };
+         acousticSync.once('host_cal_finished', onFinished);
+         acousticSync.startHostCalibration(node.deviceId);
+       });
+       
+       // 1 second buffer between runs
+       await new Promise(r => setTimeout(r, 1000));
+    }
+    
+    btnAutoCal.disabled = false;
   });
 
   // AuraSync Handlers (Host-side)

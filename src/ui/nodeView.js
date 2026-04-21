@@ -186,6 +186,22 @@ export function renderNodeView() {
       </div>
     </div>
 
+    <!-- Active Listening Overlay -->
+    <div class="modal-overlay hidden" id="modal-listening-active">
+      <div class="modal glass-card glow-breathe">
+        <div class="modal-icon">👂</div>
+        <h2 class="modal-title">Host is Calibrating...</h2>
+        <p class="modal-body">
+          This device is currently listening for acoustic sync pulses. 
+          <br><br>
+          <span class="text-secondary">Please keep the room quiet for best results.</span>
+        </p>
+        <div class="sync-progress-bar-container" style="height: 10px; background: rgba(255,255,255,0.1); border-radius: 5px; overflow: hidden; margin-top: 20px;">
+          <div id="listening-progress-bar" style="height: 100%; width: 0%; background: var(--accent-primary); transition: width 0.3s ease;"></div>
+        </div>
+      </div>
+    </div>
+
     <style>
       .node-layout {
         max-width: 500px;
@@ -597,32 +613,53 @@ function bindNodeEvents() {
   acousticSync.on('detection_started', () => {
     const btn = document.getElementById('btn-auto-sync');
     const bar = document.getElementById('sync-progress-bar');
+    const listeningModal = document.getElementById('modal-listening-active');
+    const listeningBar = document.getElementById('listening-progress-bar');
+
     if (btn) {
       btn.textContent = '👂 Listening...';
       btn.className = 'btn btn-warning btn-sm w-full pulsate';
     }
     if (bar) bar.style.width = '0%';
+    if (listeningModal) listeningModal.classList.remove('hidden');
+    if (listeningBar) listeningBar.style.width = '0%';
   });
 
   acousticSync.on('progress', (data) => {
     const btn = document.getElementById('btn-auto-sync');
     const bar = document.getElementById('sync-progress-bar');
+    const listeningBar = document.getElementById('listening-progress-bar');
+
     if (bar) bar.style.width = `${data.percent}%`;
+    if (listeningBar) listeningBar.style.width = `${data.percent}%`;
     if (btn) btn.textContent = `👂 Heard ${data.index + 1}/${data.total}`;
   });
 
   acousticSync.on('calibration_complete', (data) => {
+    // [Sync v5.3] Fail-Safe Check
+    // Only apply the offset if we have a significant number of valid detections.
+    // In the last recording, one device failed with 'error' but still applied garbage data.
+    if (!data.offset || isNaN(data.offset) || data.count < 3) {
+      showToast('Calibration data insufficient. Keeping current baseline.', 'warning');
+      return;
+    }
+
     const btn = document.getElementById('btn-auto-sync');
     const bar = document.getElementById('sync-progress-bar');
+    const listeningModal = document.getElementById('modal-listening-active');
+
     if (btn) {
       btn.textContent = '✨ Auto-Sync';
       btn.className = 'btn btn-primary btn-sm w-full';
     }
     if (bar) bar.style.width = '0%';
+    if (listeningModal) listeningModal.classList.add('hidden');
 
     const slider = document.getElementById('node-calibration');
     if (slider) {
-      slider.value = data.offset;
+      // [Sync v5.3] Apply Negated Residual: Measure +100ms late = Fire 100ms earlier (-100).
+      const correctedOffset = -Math.round(data.offset);
+      slider.value = correctedOffset;
       slider.dispatchEvent(new Event('input'));
     }
 
@@ -630,7 +667,7 @@ function bindNodeEvents() {
     const modal = document.getElementById('modal-cal-success');
     const displayVal = document.getElementById('modal-offset-val');
     if (modal && displayVal) {
-      displayVal.textContent = `${data.offset.toFixed(1)}ms`;
+      displayVal.textContent = `${(-data.offset).toFixed(1)}ms`;
       modal.classList.remove('hidden');
     }
   });
@@ -638,11 +675,14 @@ function bindNodeEvents() {
   acousticSync.on('calibration_failed', (err) => {
     const btn = document.getElementById('btn-auto-sync');
     const bar = document.getElementById('sync-progress-bar');
+    const listeningModal = document.getElementById('modal-listening-active');
+
     if (btn) {
       btn.textContent = '✨ Auto-Sync';
       btn.className = 'btn btn-primary btn-sm w-full';
     }
     if (bar) bar.style.width = '0%';
+    if (listeningModal) listeningModal.classList.add('hidden');
     showToast('Sync Failed: ' + err, 'error');
   });
 

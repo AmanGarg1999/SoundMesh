@@ -1,7 +1,5 @@
-// SoundMesh — App Bootstrap
-// Connects to server, detects role (host vs node), and initializes UI
-
 import { wsClient } from './core/wsClient.js';
+import { webrtcManager } from './core/webrtcManager.js';
 import { clockSync } from './core/clockSync.js';
 import { audioCapture } from './core/audioCapture.js';
 import { audioStreamer } from './core/audioStreamer.js';
@@ -60,6 +58,12 @@ function init() {
       // Deep update existing device to ensure UI reflects any changed state (IP, etc)
       Object.assign(appState.devices[idx], device);
     }
+
+    // [Sync v6.0] Initiate WebRTC connection if we are the host
+    if (appState.role === 'host') {
+      webrtcManager.initConnection(device.deviceId);
+    }
+
     refreshUI();
   });
 

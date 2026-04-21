@@ -7,10 +7,19 @@ export class ClockSyncMaster {
   constructor() {
     this.deviceOffsets = new Map(); 
     this.globalBuffer = 100; // ms
+    this.safetyMargin = 40;  // ms (Dynamic floor)
+    this.lastDecayTime = Date.now();
   }
 
   handlePing(deviceId, payload) {
     const serverTime = this.getServerTime();
+
+    // Periodic safety decay: Every 30s of stability, reduce margin by 5ms (Min 20ms)
+    if (Date.now() - this.lastDecayTime > 30000) {
+      this.safetyMargin = Math.max(20, this.safetyMargin - 5);
+      this.lastDecayTime = Date.now();
+      console.log(`[ClockSync] Stability detected. Receding safety margin to ${this.safetyMargin}ms`);
+    }
 
     return {
       clientSendTime: payload.clientSendTime,
@@ -18,6 +27,16 @@ export class ClockSyncMaster {
       serverSendTime: this.getServerTime(),
       globalBuffer: this.globalBuffer,
     };
+  }
+
+  /**
+   * Called when a node reports an audio drop/stutter
+   */
+  reportUnderrun() {
+    // Instant 'puff up' to handle jitter
+    this.safetyMargin = Math.min(100, this.safetyMargin + 20);
+    this.lastDecayTime = Date.now();
+    console.warn(`[ClockSync] Node reported underrun. Boosting safety margin to ${this.safetyMargin}ms`);
   }
 
   /**
@@ -33,7 +52,8 @@ export class ClockSyncMaster {
       const totalLatency = (device.outputLatency || 0) + (device.btLatency || 0);
       if (totalLatency > maxLatency) maxLatency = totalLatency;
     }
-    this.globalBuffer = Math.max(80, maxLatency + 50);
+    // Dynamic adaptation: maxLatency + current safetyMargin
+    this.globalBuffer = Math.max(60, Math.ceil(maxLatency + this.safetyMargin));
     return this.globalBuffer;
   }
 

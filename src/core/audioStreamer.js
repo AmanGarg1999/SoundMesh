@@ -2,6 +2,7 @@
 // Takes PCM chunks from AudioCapture, adds sync headers, and sends via WebSocket
 
 import { wsClient } from './wsClient.js';
+import { webrtcManager } from './webrtcManager.js';
 import { clockSync } from './clockSync.js';
 import { audioCapture } from './audioCapture.js';
 import { HEADER_SIZE, CHUNK_DURATION_MS } from '../utils/constants.js';
@@ -28,8 +29,6 @@ class AudioStreamer extends EventEmitter {
 
     audioCapture.on('audio_chunk', this.handleChunk);
     this.isStreaming = true;
-    this.chunksSent = 0;
-    this.bytesSent = 0;
     this.chunksSent = 0;
     this.bytesSent = 0;
     this.baseSharedTime = null;
@@ -60,7 +59,11 @@ class AudioStreamer extends EventEmitter {
         codec: 'opus',
         sampleRate: audioCapture.audioContext.sampleRate,
         numberOfChannels: 2,
-        bitrate: 64000, // 64kbps - excellent for stereo voice/music
+        bitrate: 48000, // 48kbps - optimal for low-latency distribution
+        opus: {
+          application: 'lowdelay',
+          complexity: 0, // Minimize CPU encoding time
+        }
       };
 
       const { supported } = await AudioEncoder.isConfigSupported(config);
@@ -92,8 +95,6 @@ class AudioStreamer extends EventEmitter {
    * Adds binary header and sends via WebSocket
    */
   handleChunk = (chunk) => {
-    if (!wsClient.connected) return;
-
     const { seq, pcmData } = chunk;
 
     // Calculate target play time analytically
@@ -126,7 +127,7 @@ class AudioStreamer extends EventEmitter {
 
         this.encoder.encode(audioData);
         audioData.close();
-        return; // sendBinary will happen in output callback
+        return; // sendPacket will happen in output callback
       } catch (err) {
         console.error('[AudioStreamer] Encode failed, falling back to PCM:', err);
         this.useOpus = false;
@@ -150,33 +151,38 @@ class AudioStreamer extends EventEmitter {
   }
 
   /**
-   * Universal binary packet builder
-   * @param {number} seq 
-   * @param {number} targetPlayTime 
-   * @param {ArrayBuffer} dataBuffer 
-   * @param {number} flags 0x00 = PCM, 0x02 = Opus
+   * Broadcast audio packet to all nodes via WebRTC (Primary) or WebSocket (Fallback)
    */
-  sendPacket(seq, targetPlayTime, dataBuffer, flags) {
-    const packet = new ArrayBuffer(HEADER_SIZE + dataBuffer.byteLength);
-    const view = new DataView(packet);
+  sendPacket(seq, timestamp, data, flags) {
+    // 1. Build binary header (16 bytes)
+    const header = new ArrayBuffer(HEADER_SIZE);
+    const view = new DataView(header);
+    
+    view.setUint32(0, seq, true);
+    view.setFloat64(4, timestamp, true);
+    view.setUint16(12, 0x0003, true); // stereo mask
+    view.setUint16(14, flags, true);
 
-    // Header
-    view.setUint32(0, seq, true);                    // [0-3]  sequence number
-    view.setFloat64(4, targetPlayTime, true);        // [4-11] target play time (ms)
-    view.setUint16(12, 0x0003, true);                // [12-13] channel mask
-    view.setUint16(14, flags, true);                 // [14-15] flags (0x02 = Opus)
+    // 2. Concatenate header + audio data
+    const packet = new Uint8Array(HEADER_SIZE + data.byteLength);
+    packet.set(new Uint8Array(header), 0);
+    packet.set(new Uint8Array(data), HEADER_SIZE);
 
-    // Data payload
-    new Uint8Array(packet, HEADER_SIZE).set(new Uint8Array(dataBuffer));
-
-    wsClient.sendBinary(packet);
+    // [Sync v6.0] Broadcast via WebRTC DataChannel (UDP Mode)
+    // This eliminates TCP Head-of-Line blocking for binary audio data.
+    webrtcManager.broadcast(packet.buffer);
+    
+    // Also send via WebSocket as fallback for stability if no WebRTC peers are ready
+    if (webrtcManager.dataChannels.size === 0) {
+      wsClient.sendBinary(packet.buffer);
+    }
 
     this.chunksSent++;
     this.bytesSent += packet.byteLength;
 
     this.emit('chunk_sent', {
       seq,
-      targetPlayTime,
+      targetPlayTime: timestamp,
       bytes: packet.byteLength,
       totalChunks: this.chunksSent,
     });

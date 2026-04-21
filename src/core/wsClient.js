@@ -3,6 +3,7 @@
 
 import { EventEmitter } from '../utils/helpers.js';
 import { RECONNECT_MAX_RETRIES, RECONNECT_BASE_DELAY } from '../utils/constants.js';
+import { webrtcManager } from './webrtcManager.js';
 
 class WSClient extends EventEmitter {
   constructor() {
@@ -42,6 +43,7 @@ class WSClient extends EventEmitter {
         deviceId: this.deviceId,
         roleIntent: roleIntent,
         name: localStorage.getItem('soundmesh_device_name'),
+        pin: localStorage.getItem('soundmesh_pin') || null,
       });
     };
 
@@ -87,6 +89,10 @@ class WSClient extends EventEmitter {
         
         console.log(`[WSClient] Assigned as ${this.role} (ID: ${this.deviceId})`);
         this.emit('welcome', msg.payload);
+        break;
+
+      case 'webrtc_signal':
+        webrtcManager.handleSignal(msg.payload.fromDeviceId, msg.payload.signal);
         break;
 
       default:

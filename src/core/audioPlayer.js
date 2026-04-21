@@ -4,6 +4,8 @@
 
 import { EventEmitter, int16ToFloat32 } from '../utils/helpers.js';
 import { clockSync } from './clockSync.js';
+import { webrtcManager } from './webrtcManager.js';
+import { wsClient } from './wsClient.js';
 import { JitterBuffer } from './jitterBuffer.js';
 import {
   SAMPLE_RATE,
@@ -54,12 +56,18 @@ class AudioPlayer extends EventEmitter {
 
     // Stats
     this.syncDrift = 0;
-    this.outputLatency = 0;
+    this.activeSources = new Set();
 
     // Surround Sound state
     this.surroundMask = 'all'; // 'left', 'right', 'all', 'center', 'lfe'
     this.spatialDelayMs = 0;
     this.calibrationOffsetMs = 0; // Manual user nudge (ms)
+    this.lastCalibrationTime = 0; // Timestamp of last calibration
+    
+    // [Sync v6.0] AudioWorklet state
+    this.workletNode = null;
+    this.heartbeatOsc = null;
+    this.heartbeatGain = null;
   }
 
   /**
@@ -68,7 +76,16 @@ class AudioPlayer extends EventEmitter {
   async init() {
     if (this.audioContext) return;
 
-    this.audioContext = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: 'playback' });
+    // Detect platform for latencyHint optimization
+    const ua = navigator.userAgent.toLowerCase();
+    this.isAndroid = ua.includes('android');
+    this.isIOS = /iphone|ipad|ipod/.test(ua);
+
+    // Android benefits from 'interactive' hint (shorter buffer = less pipeline delay)
+    // Apple devices work best with 'playback' (stable, long buffers)
+    const hint = this.isAndroid ? 'interactive' : 'playback';
+
+    this.audioContext = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: hint });
     this.audioContext.onstatechange = () => console.log('[AudioPlayer] Native state:', this.audioContext.state);
 
     // Create gain node for volume control
@@ -81,23 +98,64 @@ class AudioPlayer extends EventEmitter {
     this.analyserNode.connect(this.gainNode);
 
     // [Sync v3.1] Each output device now gets its own subgraph connected to GainNode
-    // This allows us to apply a custom delay to every physical device (internal vs BT)
     console.log('[AudioPlayer] Ready for multi-sink routing');
 
     // [Reliability] Clock Anchor: Create a silent tether to the hardware destination
-    // This prevents the browser from putting the audio graph to sleep (keep-alive)
     const anchor = this.audioContext.createGain();
     anchor.gain.value = 0;
     this.gainNode.connect(anchor);
     anchor.connect(this.audioContext.destination);
 
-    // Measure output latency
-    this.outputLatency = this.audioContext.outputLatency || 0;
+    // [iOS v6.1] Ultrasonic Persistence Heartbeat
+    // We play a 15,500Hz sine wave at very low volume
+    // This is inaudible but prevents iOS from suspending the audio thread
+    try {
+      this.heartbeatOsc = this.audioContext.createOscillator();
+      this.heartbeatGain = this.audioContext.createGain();
+      this.heartbeatOsc.type = 'sine';
+      this.heartbeatOsc.frequency.setValueAtTime(15500, this.audioContext.currentTime);
+      this.heartbeatGain.gain.setValueAtTime(0.001, this.audioContext.currentTime);
+      
+      this.heartbeatOsc.connect(this.heartbeatGain);
+      this.heartbeatGain.connect(this.audioContext.destination);
+      this.heartbeatOsc.start();
+      console.log('[AudioPlayer] Inaudible ultrasonic heartbeat active (iOS Survival)');
+    } catch (e) {}
+
+    // Resume context on visibility change
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && this.audioContext.state === 'suspended') {
+        this.audioContext.resume();
+      }
+    });
+
+    // ── Platform-Aware Output Latency ──
+    // Android Chrome frequently reports 0ms for both outputLatency and baseLatency,
+    // which causes the scheduler to target hardware time that has already passed.
+    // We apply a safe platform-specific floor based on empirical measurements.
+    let measuredLatency = this.audioContext.outputLatency || 0;
     if (this.audioContext.baseLatency) {
-      this.outputLatency += this.audioContext.baseLatency;
+      measuredLatency += this.audioContext.baseLatency;
     }
 
-    console.log(`[AudioPlayer] Initialized. Output latency: ${(this.outputLatency * 1000).toFixed(1)}ms`);
+    if (this.isAndroid && measuredLatency < 0.03) {
+      // Android typically has 40-80ms of real pipeline delay
+      this.outputLatency = 0.06;
+      console.log(`[AudioPlayer] Android detected. Overriding latency: reported=${(measuredLatency*1000).toFixed(1)}ms, using=60ms`);
+    } else if (this.isIOS && measuredLatency < 0.01) {
+      this.outputLatency = 0.03;
+      console.log(`[AudioPlayer] iOS detected. Overriding latency: using=30ms`);
+    // [Sync v6.0] Load High-Priority Playback Worklet
+    try {
+      await this.audioContext.audioWorklet.addModule(new URL('./playbackWorklet.js', import.meta.url));
+      this.workletNode = new AudioWorkletNode(this.audioContext, 'playback-worklet');
+      this.workletNode.connect(this.analyserNode);
+      console.log('[AudioPlayer] PlaybackWorklet active (High Priority Mode)');
+    } catch (e) {
+      console.error('[AudioPlayer] Failed to load AudioWorklet:', e);
+    }
+
+    console.log(`[AudioPlayer] Initialized (${this.isAndroid ? 'Android' : this.isIOS ? 'iOS' : 'Desktop'}). Output latency: ${(this.outputLatency * 1000).toFixed(1)}ms`);
   }
 
   /**
@@ -324,6 +382,25 @@ class AudioPlayer extends EventEmitter {
     }
   }
 
+  /**
+   * Reset Decoder state on packet loss to prevent artifacts
+   */
+  resetDecoder() {
+    if (this.decoder && this.decoder.state === 'configured') {
+      try {
+        this.decoder.reset();
+        this.decoder.configure({
+          codec: 'opus',
+          sampleRate: SAMPLE_RATE,
+          numberOfChannels: 2,
+        });
+        console.log('[AudioPlayer] Opus decoder state flushed');
+      } catch (e) {
+        console.error('[AudioPlayer] Failed to reset decoder:', e);
+      }
+    }
+  }
+
   setVolume(value) {
     this.volume = Math.max(0, Math.min(1, value));
     if (this.gainNode && this.audioContext) {
@@ -372,6 +449,8 @@ class AudioPlayer extends EventEmitter {
    */
   setCalibrationOffset(ms) {
     this.calibrationOffsetMs = ms;
+    this.lastCalibrationTime = performance.now();
+    this.driftIntegral = 0; // Reset integrator on shift
     console.log(`[AudioPlayer] Calibration offset set to ${ms}ms`);
   }
 
@@ -395,6 +474,16 @@ class AudioPlayer extends EventEmitter {
     this.nextScheduledTime = 0;
     this.isFirstChunk = true;
   
+    // [Sync v6.0] Listen for WebRTC audio data (UDP Path)
+    webrtcManager.on('audio_data', (data) => this.receiveChunk(data));
+    
+    // Fallback: Listen for WebSocket data only if no WebRTC peers are ready
+    wsClient.on('audio_data', (data) => {
+      if (webrtcManager.dataChannels.size === 0) {
+        this.receiveChunk(data);
+      }
+    });
+
     // Start scheduler via Web Worker (Bypasses background throttling)
     if (!this.schedulerWorker) {
       this.schedulerWorker = new Worker(new URL('./scheduler.worker.js', import.meta.url), { type: 'module' });
@@ -433,6 +522,15 @@ class AudioPlayer extends EventEmitter {
     if (this.backgroundAudio) {
       this.backgroundAudio.pause();
     }
+  
+    // [Sync v5.5] Instant Termination
+    // Kill all currently playing and scheduled sources immediately
+    this.activeSources.forEach(source => {
+      try { source.stop(); } catch (e) {}
+      try { source.disconnect(); } catch (e) {}
+    });
+    this.activeSources.clear();
+    this.jitterBuffer.clear();
   
     if (navigator.mediaSession) {
       navigator.mediaSession.playbackState = 'paused';
@@ -482,6 +580,14 @@ class AudioPlayer extends EventEmitter {
 
       if (isOpus) {
         if (this.useOpus && this.decoder && this.decoder.state === 'configured') {
+          // [Opus Recovery] If we skipped a sequence, the stateful decoder will output garbage
+          // We must flush it before giving it the next chunk.
+          if (this.lastReceivedSeq !== undefined && seq > this.lastReceivedSeq + 1) {
+            console.warn(`[AudioPlayer] Gap detected (Got seq ${seq}, expected ${this.lastReceivedSeq + 1}). Flushing decoder.`);
+            this.resetDecoder();
+          }
+          this.lastReceivedSeq = seq;
+
           // Feed to WebCodecs decoder
           const opusData = new Uint8Array(arrayBuffer, HEADER_SIZE);
           const timestamp = Math.round(targetPlayTime * 1000); // Enforce integer microsecond
@@ -592,47 +698,78 @@ class AudioPlayer extends EventEmitter {
     const now = this.audioContext.currentTime;
     const sharedTimeNow = clockSync.getSharedTime();
 
-    // Schedule up to 8 buffers ahead to prevent underruns
+    // Android devices have jittery timer callbacks, so we schedule more aggressively
+    // and tolerate older chunks instead of dropping them
+    const maxSchedule = this.isAndroid ? 12 : 8;
+    const futureThresholdMs = this.isAndroid ? 300 : 200;
+    const staleThresholdMs = this.isAndroid ? -400 : -250;
+
     let scheduled = 0;
-    const maxSchedule = 8;
 
     while (scheduled < maxSchedule) {
       const chunk = this.jitterBuffer.peek();
-      if (!chunk) break;
+      if (!chunk) {
+        // [Sync v5.6] Underrun Watchdog
+        // If we are actively playing but the buffer is empty, tell the server 
+        // to puff up the global buffer to prevent future stutters
+        if (this.isPlaying && this.chunksPlayed > 10) {
+          wsClient.send('underrun_report');
+        }
+        break;
+      }
 
       const timeUntilPlayMs = chunk.targetPlayTime - sharedTimeNow;
 
       // If this chunk is too far in the future, wait
-      if (timeUntilPlayMs > 200) {
+      if (timeUntilPlayMs > futureThresholdMs) {
         break;
       }
 
       this.jitterBuffer.pop();
 
       // If chunk is too far in the past, drop it to catch up
-      if (timeUntilPlayMs < -250) {
+      if (timeUntilPlayMs < staleThresholdMs) {
         // console.warn(`[AudioPlayer] Dropping stale chunk (late by ${-timeUntilPlayMs.toFixed(0)}ms)`);
         continue;
       }
-
-      // Calculate perfect absolute AudioContext time
-      // We SUBTRACT spatialDelayMs because speakers further away must play EARLIER
-      // We ADD calibrationOffsetMs because Bluetooth speakers take LONGER to process
-      // absolutePlayAt = now + (sharedDelta - spatialDelay + calibrationOffset - hardwareLatency)
+      
+      // [Sync v5.3] Restored Baseline Latency
+      // We subtract the reported outputLatency to provide a 'close-enough' baseline 
+      // immediately. AuraSync will then calibrate the REMAINING residual error.
       let absolutePlayAt = now + 
         ((timeUntilPlayMs - this.spatialDelayMs + this.calibrationOffsetMs) / 1000) - 
-        this.outputLatency + 
-        this.localDelayOffset;
+        this.outputLatency;
+
+      // [Sync v4.2] Sample-Discrete Quantization
+      // We align the hardware target to the nearest 1/48000s boundary.
+      // This eliminates the 'floating phase' that causes the hollow phasing sound.
+      const sampleStep = 1 / SAMPLE_RATE;
+      absolutePlayAt = Math.round(absolutePlayAt / sampleStep) * sampleStep;
 
       if (this.isFirstChunk) {
-        if (absolutePlayAt < now) {
-          const needed = (now + 0.05) - absolutePlayAt;
-          this.localDelayOffset += needed;
-          absolutePlayAt += needed;
+        // [Sync v5.4] First Chunk Guard
+        // If the first chunk is late, we calibrate, but we CLAMP the adjustment 
+        // to 500ms to prevent runaway inflation during initial clock convergence.
+        if (absolutePlayAt < now + 0.05) {
+          let neededMs = ((now + 0.06) - absolutePlayAt) * 1000;
+          neededMs = Math.min(500, neededMs); // Safety Ceiling
+          
+          this.calibrationOffsetMs += neededMs;
+          absolutePlayAt = now + 0.06;
+          console.log(`[AudioPlayer] First chunk late. Clamped adjustment: ${neededMs.toFixed(1)}ms. Total offset: ${this.calibrationOffsetMs.toFixed(1)}ms`);
         }
-        this.nextScheduledTime = absolutePlayAt;
+
+        // [Sync v5.5] Global Phase-Lock
+        // We anchor the session start to a synchronized 100ms grid on the MASTER CLOCK.
+        // This ensures every device starts its first sample on the same phase boundary.
+        const sharedAnchorTime = Math.ceil(sharedTimeNow / 100) * 100;
+        const localAnchorTime = clockSync.toLocalTime(sharedAnchorTime);
+        const quantizedAnchor = Math.round(localAnchorTime / sampleStep) * sampleStep;
+        
+        // Ensure anchor is in the future
+        this.nextScheduledTime = Math.max(quantizedAnchor, now + 0.05);
         this.isFirstChunk = false;
-        console.log(`[AudioPlayer] First chunk scheduled. Sync delay: ${timeUntilPlayMs.toFixed(0)}ms`);
+        console.log(`[AudioPlayer] Phase-Locked session to ${sharedAnchorTime % 1000}ms grid. Anchor offset: ${(this.nextScheduledTime - now).toFixed(3)}s`);
       }
 
       // absolutePlayAt is when this buffer SHOULD play perfectly in sync.
@@ -640,23 +777,42 @@ class AudioPlayer extends EventEmitter {
       let drift = absolutePlayAt - this.nextScheduledTime;
 
       // ── Sync Catastrophe Recovery ──
-      // If we are catastrophically drifting (>100ms off), we snap to target immediately
-      // rather than trying to fix it at 0.5% rate limit (which would take 20s+).
-      if (Math.abs(drift) > 0.100) {
-        console.warn(`[AudioPlayer] Sync catastrophe: drift is ${(drift * 1000).toFixed(1)}ms. Snapping.`);
-        this.nextScheduledTime = absolutePlayAt;
-        this.driftIntegral = 0; // Reset integrator
-        drift = 0; 
+      // [Sync v5.4] Severe Desync Recovery
+      // If we are more than 1 second out of sync (Massive Clock Drift),
+      // we reset the anchor entirely. This clears the '10-second delay' loop instantly.
+      if (Math.abs(drift) > 1.0) {
+        console.warn(`[AudioPlayer] Severe desync (${(drift*1000).toFixed(0)}ms). Re-anchoring session.`);
+        this.isFirstChunk = true;
+        this.nextScheduledTime = 0;
+        this.driftIntegral = 0;
+        continue; // Skip this chunk and let the next one re-anchor
+      }
+
+      // [Sync v4.1] Catastrophe Recovery: If we are more than 50ms out of sync, 
+      // do an instant jump to the target time instead of relying on the PI controller.
+      // Reduced from 100ms to 50ms for ultra-low latency response.
+      const isSettling = (performance.now() - this.lastCalibrationTime) < 3000;
+      if (Math.abs(drift) > 0.050 && !isSettling) {
+        const snapTarget = Math.max(absolutePlayAt, now + 0.02);
+        this.nextScheduledTime = snapTarget;
+        console.log(`[AudioPlayer] Sync Catastrophe! Snapped to ${(drift*1000).toFixed(0)}ms drift.`);
+        this.driftIntegral = 0;
       }
 
       // ── Audio Phase-Locked Loop (PI Controller) ──
-      
-      // Update integral term with anti-windup clamping
-      this.driftIntegral += drift;
-      this.driftIntegral = Math.max(-PI_INTEGRAL_MAX, Math.min(PI_INTEGRAL_MAX, this.driftIntegral));
-
+      // Adjusted Deadzone: Sub-millisecond precision is required to avoid phasing.
+      // We now target 0.1ms (5 samples) rather than 0.5ms.
+      const deadzone = 0.0001; 
       let rate = 1.0;
-      if (Math.abs(drift) > 0.0005) { // 0.5ms deadzone
+
+      // [Sync v5.2] PI Settling Window
+      // We pause speed adjustments for 3 seconds after an offset change to allow
+      // the new 'Zero Baseline' to settle without speed-side interference.
+      if (Math.abs(drift) > deadzone && !isSettling) {
+        // Update integral term with anti-windup clamping
+        this.driftIntegral += drift;
+        this.driftIntegral = Math.max(-PI_INTEGRAL_MAX, Math.min(PI_INTEGRAL_MAX, this.driftIntegral));
+
         // PI Control: u = Kp * error + Ki * integral
         const adjustment = (drift * PI_KP) + (this.driftIntegral * PI_KI);
         rate = 1.0 - adjustment;
@@ -668,6 +824,8 @@ class AudioPlayer extends EventEmitter {
         // If within deadzone, slowly decay the integral term to avoid oscillation
         this.driftIntegral *= 0.99;
       }
+
+      // Buffer Drain Override removed due to Web Audio queue masking.
 
       // Create audio buffer from PCM data
       const audioBuffer = this.audioContext.createBuffer(
@@ -704,17 +862,31 @@ class AudioPlayer extends EventEmitter {
       source.playbackRate.value = rate;
       source.connect(this.analyserNode);
 
+      // Track for instant termination
+      this.activeSources.add(source);
+      
       // Memory leak cleanup: unmount after playback
       source.onended = () => {
+        this.activeSources.delete(source);
         source.disconnect();
       };
 
-      const actualPlayAt = Math.max(this.nextScheduledTime, now);
-      source.start(actualPlayAt);
+      // [Sync v6.0] Transfer to High-Priority AudioWorklet
+      if (this.workletNode) {
+        this.workletNode.port.postMessage({
+          type: 'push',
+          payload: chunk.pcmData
+        });
+      } else {
+        // Fallback to legacy scheduling if Worklet failed
+        const actualPlayAt = Math.max(this.nextScheduledTime, now);
+        source.start(actualPlayAt);
+      }
 
-      // Advance the schedule by exactly the dynamically stretched duration
+      // [Sync v5.2] Advance schedule with sample-discrete precision
       const chunkDuration = SAMPLES_PER_CHUNK / SAMPLE_RATE;
-      this.nextScheduledTime = actualPlayAt + (chunkDuration / rate);
+      const nextTime = actualPlayAt + (chunkDuration / rate);
+      this.nextScheduledTime = Math.round(nextTime / sampleStep) * sampleStep;
 
       // Track drift for stats
       const idealPlayTime = now + (timeUntilPlayMs / 1000);

@@ -25,6 +25,21 @@ export default defineConfig({
         ws: true,
         changeOrigin: true,
         secure: false, // Ignore self-signed certs
+        // [Reliability] Suppress noisy socket resets during dev/mobile reconnects
+        configure: (proxy, _options) => {
+          proxy.on('error', (err, _req, _res) => {
+            const silent = ['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ECANCELED'].includes(err.code);
+            if (silent) return;
+            console.warn('[Vite Proxy] Socket Error:', err.message);
+          });
+          proxy.on('proxyReqWs', (proxyReq, req, socket, options, head) => {
+            socket.on('error', (err) => {
+              const silent = ['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ECANCELED'].includes(err.code);
+              if (silent) return;
+              console.warn('[Vite Proxy] WS Socket Error:', err.message);
+            });
+          });
+        },
       },
       '/api': {
         target: 'https://127.0.0.1:3000',

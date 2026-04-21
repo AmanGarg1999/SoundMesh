@@ -39,12 +39,25 @@ export class AudioRelay {
       }
     }
 
-    // Fan out to all connected devices (including the host so they can loopback for sync)
-    wss.clients.forEach((client) => {
-      if (client.readyState === client.OPEN) {
-        client.send(data, { binary: true });
+    // Fan out to all connected devices without blocking the Node.js event loop
+    const clients = Array.from(wss.clients);
+    const CHUNK_SIZE = 10;
+    let i = 0;
+
+    const processChunk = () => {
+      const end = Math.min(i + CHUNK_SIZE, clients.length);
+      for (; i < end; i++) {
+        const client = clients[i];
+        if (client.readyState === client.OPEN) {
+          client.send(data, { binary: true });
+        }
       }
-    });
+      if (i < clients.length) {
+        setImmediate(processChunk);
+      }
+    };
+
+    processChunk();
 
     this.stats.chunksRelayed++;
   }

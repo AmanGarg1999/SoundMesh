@@ -199,14 +199,22 @@ wss.on('connection', (ws, req) => {
           const referer = req.headers.referer || '';
           const isFromLocalhost = isLoopback || referer.includes('localhost') || referer.includes('127.0.0.1');
 
-          const deviceId = deviceRegistry.register(ws, {
+          const regResult = deviceRegistry.register(ws, {
             deviceId: requestedId,
             roleIntent: roleIntent,
             name: name,
             ip: realIP,
             isLocalhost: isFromLocalhost,
             userAgent: req.headers['user-agent'],
+            pin: msg.payload.pin,
           });
+
+          if (regResult && regResult.error === 'invalid_pin') {
+            sendJSON(ws, { type: 'pin_required' });
+            return;
+          }
+
+          const deviceId = regResult;
 
           // Attach ID to socket for reliable cleanup
           ws.deviceId = deviceId;
@@ -221,7 +229,10 @@ wss.on('connection', (ws, req) => {
               deviceId,
               role: device.role,
               name: device.name,
-              session: sessionManager.getSessionInfo(),
+              session: {
+                ...sessionManager.getSessionInfo(),
+                pin: deviceRegistry.roomPin
+              },
               devices: deviceRegistry.getAllDevices(),
             },
           });
@@ -270,7 +281,12 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('error', (err) => {
-    console.error(`[SoundMesh] WebSocket error for ${deviceId}:`, err.message);
+    // Gracefully ignore ungraceful closure issues (e.g., iPhone locks screen)
+    if (err.code === 'ECONNRESET') return;
+    
+    // Safely attempt to log device if known
+    const id = ws.deviceId || 'Unknown';
+    console.warn(`[SoundMesh] WebSocket error (${id}):`, err.message);
   });
 });
 
@@ -340,6 +356,34 @@ function handleMessage(ws, deviceId, msg) {
         type: 'global_buffer_update',
         payload: { globalBuffer },
       });
+      break;
+    }
+
+    case 'underrun_report': {
+      clockSync.reportUnderrun();
+      // Force immediate global buffer update to all nodes
+      const globalBuffer = clockSync.recalculateGlobalBuffer(deviceRegistry.getAllDevices());
+      broadcastJSON({
+        type: 'global_buffer_update',
+        payload: { globalBuffer },
+      });
+      break;
+    }
+
+    // ── WebRTC Signaling relay ──
+    case 'webrtc_signal': {
+      const { targetDeviceId, signal } = msg.payload;
+      const targetWs = Array.from(wss.clients).find(c => c.deviceId === targetDeviceId);
+      
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(JSON.stringify({
+          type: 'webrtc_signal',
+          payload: {
+            fromDeviceId: deviceId,
+            signal
+          }
+        }));
+      }
       break;
     }
 

@@ -25,6 +25,7 @@ class ClockSync extends EventEmitter {
     this.minRtt = Infinity;
     this.lastSyncTime = 0;     // Local time of last valid sync
     this.consecutiveRejectedPings = 0;
+    this.totalPingsReceived = 0; // Track convergence phase
     
     this.globalBuffer = DEFAULT_GLOBAL_BUFFER;
     this.syncStatus = 'unknown';
@@ -47,9 +48,11 @@ class ClockSync extends EventEmitter {
       this.globalBuffer = payload.globalBuffer;
     });
 
+    // Phase 1: Aggressive initial convergence (100ms pings for first 20 samples)
+    // This lets Android devices with noisy clocks lock on faster.
     this.sendPing();
-    this.intervalId = setInterval(() => this.sendPing(), SYNC_INTERVAL_MS);
-    console.log('[ClockSync] Started with Predictive Modeling');
+    this.intervalId = setInterval(() => this.sendPing(), SYNC_AGGRESSIVE_MS);
+    console.log('[ClockSync] Started with Aggressive Initial Convergence');
   }
 
   stop() {
@@ -74,14 +77,20 @@ class ClockSync extends EventEmitter {
     const rtt = clientReceiveTime - clientSendTime;
     const offset = ((serverReceiveTime - clientSendTime) + (serverSendTime - clientReceiveTime)) / 2;
 
+    this.totalPingsReceived++;
+
+    // Phase transition: After 20 aggressive pings, switch to steady-state interval.
+    if (this.totalPingsReceived === 20 && this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = setInterval(() => this.sendPing(), SYNC_INTERVAL_MS);
+      console.log('[ClockSync] Convergence phase complete. Switching to steady-state.');
+    }
+
     // ── Adaptive RTT & Golden Sample Logic ──
-    // Slowly relax our minimum RTT so we can adapt if the network permanently degrades
     if (this.minRtt !== Infinity) {
       this.minRtt += 0.5; 
     }
 
-    // We only update our base offset if this RTT is within a reasonable range of our best seen
-    // OR if we've been starved of valid pings for too long (Safety Fallback)
     if (rtt < this.minRtt * 1.5 || this.minRtt === Infinity || this.consecutiveRejectedPings >= 5) {
       if (rtt < this.minRtt) this.minRtt = rtt;
       
@@ -102,13 +111,19 @@ class ClockSync extends EventEmitter {
     if (this.rttSamples.length > SYNC_WINDOW_SIZE) this.rttSamples.shift();
 
     const avgRtt = this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length;
-    const avgOffset = this.offsetSamples.reduce((a, b) => a + b, 0) / this.offsetSamples.length;
 
-    this.offset = avgOffset;
+    // ── Median Offset Filter ──
+    // Android devices (especially Redmi/Xiaomi) have aggressive GC pauses that create
+    // massive offset outliers. A simple average gets permanently poisoned by these.
+    // The median is immune to outliers, giving us a rock-solid center estimate.
+    const sortedOffsets = [...this.offsetSamples].sort((a, b) => a - b);
+    const medianOffset = sortedOffsets[Math.floor(sortedOffsets.length / 2)];
+
+    this.offset = medianOffset;
     this.globalBuffer = globalBuffer || this.globalBuffer;
 
     const variance = this.offsetSamples.length > 1
-      ? Math.sqrt(this.offsetSamples.reduce((sum, o) => sum + Math.pow(o - avgOffset, 2), 0) / (this.offsetSamples.length - 1))
+      ? Math.sqrt(this.offsetSamples.reduce((sum, o) => sum + Math.pow(o - medianOffset, 2), 0) / (this.offsetSamples.length - 1))
       : 0;
 
     let newStatus = 'in_sync';
@@ -118,7 +133,7 @@ class ClockSync extends EventEmitter {
     this.syncStatus = newStatus;
     this.stats = { 
       avgRtt, 
-      avgOffset, 
+      avgOffset: medianOffset, 
       skewPpm: (this.skew * 1000000).toFixed(2), 
       offsetVariance: variance 
     };

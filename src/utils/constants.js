@@ -18,16 +18,16 @@ export const HEADER_SIZE = 16;
 // Sync engine
 export const SYNC_INTERVAL_MS = 500;       // Clock sync beacon interval
 export const SYNC_AGGRESSIVE_MS = 100;     // Aggressive resync interval
-export const SYNC_WINDOW_SIZE = 16;        // Rolling average window (increased for stability)
-export const SKEW_WINDOW_SIZE = 32;        // Window for linear regression of clock skew
-export const SYNC_OK_THRESHOLD = 3;        // ms — in sync (tightened from 5ms)
-export const SYNC_DRIFT_THRESHOLD = 15;    // ms — drifting
-export const DEFAULT_GLOBAL_BUFFER = 150;  // ms (increased for stability)
+export const SYNC_WINDOW_SIZE = 32;        // Rolling average window (doubled for stability)
+export const SKEW_WINDOW_SIZE = 64;        // Window for linear regression of clock skew
+export const SYNC_OK_THRESHOLD = 1.5;      // ms — in sync (tightened for phase alignment)
+export const SYNC_DRIFT_THRESHOLD = 10;    // ms — drifting
+export const DEFAULT_GLOBAL_BUFFER = 80;   // ms (reduced for ultra-low latency)
 
 // PI Controller for phase locking
-export const PI_KP = 0.05;                 // Smooth proportional gain
-export const PI_KI = 0.002;                // Smooth integral gain
-export const PI_INTEGRAL_MAX = 0.03;       // Anti-windup cap
+export const PI_KP = 0.02;                 // Smooth proportional gain (lowered to suppress jitter)
+export const PI_KI = 0.0005;               // Smooth integral gain (lowered to prevent hunting)
+export const PI_INTEGRAL_MAX = 0.02;       // Anti-windup cap
 
 // Jitter buffer
 export const JITTER_MIN_MS = 20;
