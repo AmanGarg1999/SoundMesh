@@ -145,6 +145,10 @@ class AudioPlayer extends EventEmitter {
     } else if (this.isIOS && measuredLatency < 0.01) {
       this.outputLatency = 0.03;
       console.log(`[AudioPlayer] iOS detected. Overriding latency: using=30ms`);
+    } else {
+      this.outputLatency = measuredLatency;
+    }
+
     // [Sync v6.0] Load High-Priority Playback Worklet
     try {
       await this.audioContext.audioWorklet.addModule(new URL('./playbackWorklet.js', import.meta.url));
@@ -474,6 +478,11 @@ class AudioPlayer extends EventEmitter {
     this.nextScheduledTime = 0;
     this.isFirstChunk = true;
   
+    // [Sync v6.0] Signal Worklet to start consuming
+    if (this.workletNode) {
+      this.workletNode.port.postMessage({ type: 'start' });
+    }
+
     // [Sync v6.0] Listen for WebRTC audio data (UDP Path)
     webrtcManager.on('audio_data', (data) => this.receiveChunk(data));
     
@@ -488,7 +497,10 @@ class AudioPlayer extends EventEmitter {
     if (!this.schedulerWorker) {
       this.schedulerWorker = new Worker(new URL('./scheduler.worker.js', import.meta.url), { type: 'module' });
       this.schedulerWorker.onmessage = () => {
-        if (this.isPlaying) this.scheduleBuffers();
+        if (this.isPlaying) {
+          this.scheduleBuffers();
+          this.updateWorkletClock();
+        }
       };
     }
     this.schedulerWorker.postMessage({ action: 'start', interval: 20 });
@@ -515,6 +527,12 @@ class AudioPlayer extends EventEmitter {
    */
   stop() {
     this.isPlaying = false;
+    
+    // [Sync v6.0] Signal Worklet to stop
+    if (this.workletNode) {
+      this.workletNode.port.postMessage({ type: 'stop' });
+    }
+
     if (this.schedulerWorker) {
       this.schedulerWorker.postMessage({ action: 'stop' });
     }
@@ -820,9 +838,17 @@ class AudioPlayer extends EventEmitter {
         // Enforce strictly imperceptible rate limits (±0.5%)
         const limit = PLAYBACK_RATE_ADJUST;
         rate = Math.max(1.0 - limit, Math.min(1.0 + limit, rate));
+
+        // [Sync v6.0] Update Worklet Playback Rate
+        if (this.workletNode) {
+          this.workletNode.port.postMessage({ type: 'set_rate', payload: rate });
+        }
       } else {
         // If within deadzone, slowly decay the integral term to avoid oscillation
         this.driftIntegral *= 0.99;
+        if (this.workletNode) {
+          this.workletNode.port.postMessage({ type: 'set_rate', payload: 1.0 });
+        }
       }
 
       // Buffer Drain Override removed due to Web Audio queue masking.
@@ -874,8 +900,11 @@ class AudioPlayer extends EventEmitter {
       // [Sync v6.0] Transfer to High-Priority AudioWorklet
       if (this.workletNode) {
         this.workletNode.port.postMessage({
-          type: 'push',
-          payload: chunk.pcmData
+          type: 'push_chunk', // Match worklet's expectation
+          payload: {
+            data: chunk.pcmData,
+            targetPlayTime: absolutePlayAt * 1000 // In ms for worklet
+          }
         });
       } else {
         // Fallback to legacy scheduling if Worklet failed
@@ -1055,6 +1084,22 @@ class AudioPlayer extends EventEmitter {
       volume: this.volume,
       muted: this.muted,
     };
+  }
+  /**
+   * Propagate shared clock state to AudioWorklet for autonomous scheduling
+   */
+  updateWorkletClock() {
+    if (!this.workletNode) return;
+
+    this.workletNode.port.postMessage({
+      type: 'sync_update',
+      payload: {
+        offset: clockSync.offset,
+        skew: clockSync.skew,
+        lastSyncTime: clockSync.lastSyncTime,
+        timeOrigin: performance.timeOrigin
+      }
+    });
   }
 }
 

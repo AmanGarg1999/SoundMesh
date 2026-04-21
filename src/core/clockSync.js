@@ -75,6 +75,11 @@ class ClockSync extends EventEmitter {
     const { clientSendTime, serverReceiveTime, serverSendTime, globalBuffer } = payload;
 
     const rtt = clientReceiveTime - clientSendTime;
+    const upLeg = serverReceiveTime - clientSendTime;
+    const downLeg = clientReceiveTime - serverSendTime;
+    
+    // Asymmetry is roughly (upLeg - downLeg) / 2
+    const asymmetry = (upLeg - downLeg) / 2;
     const offset = ((serverReceiveTime - clientSendTime) + (serverSendTime - clientReceiveTime)) / 2;
 
     this.totalPingsReceived++;
@@ -95,8 +100,14 @@ class ClockSync extends EventEmitter {
       if (rtt < this.minRtt) this.minRtt = rtt;
       
       this.consecutiveRejectedPings = 0;
-      this.offsetSamples.push(offset);
-      this.history.push({ t: clientReceiveTime, offset });
+      
+      // [Sync v6.0] Asymmetry Compensation
+      // Standard Christian's algorithm assumes upLeg == downLeg. 
+      // If we detect a consistent bias, we apply a 30% corrective weight to the asymmetry.
+      const correctedOffset = offset - (asymmetry * 0.3);
+      
+      this.offsetSamples.push(correctedOffset);
+      this.history.push({ t: clientReceiveTime, offset: correctedOffset });
       this.lastSyncTime = clientReceiveTime;
 
       if (this.offsetSamples.length > SYNC_WINDOW_SIZE) this.offsetSamples.shift();
