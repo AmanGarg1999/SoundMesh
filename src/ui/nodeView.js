@@ -53,7 +53,10 @@ export function renderNodeView() {
           <div class="glass-card" style="margin-bottom: 24px;">
             <div class="section-header">
               <h3 class="section-title">📡 Network Host</h3>
-              <div id="connection-badge" class="badge badge-warning">Disconnected</div>
+              <div class="flex gap-xs">
+                <div id="transport-badge" class="badge badge-info" title="Audio Transport Protocol">--</div>
+                <div id="connection-badge" class="badge badge-warning">Disconnected</div>
+              </div>
             </div>
             <div id="host-name-display" style="margin-bottom: 16px; font-weight: 500; font-size: 1.1em; color: var(--text-secondary);">Searching for Host...</div>
             <button class="btn btn-primary w-full pulsate" id="btn-connect-host" style="font-size: 1.1em; padding: 12px;">🔌 Connect to Host</button>
@@ -845,16 +848,29 @@ async function renderOutputSinks() {
 function startStatsUpdater() {
   if (statsInterval) clearInterval(statsInterval);
 
+  const offsetDisplay = document.getElementById('sync-offset-display');
+  const statsLabel = document.getElementById('sync-status-label');
+  const transportBadge = document.getElementById('transport-badge');
+  const statusDot = document.getElementById('sync-status-dot');
+  const ringProgress = document.getElementById('sync-ring-progress');
+
   statsInterval = setInterval(() => {
-    // Sync stats
     const syncStats = clockSync.getStats();
     const syncStatus = clockSync.getStatus();
+    const offset = clockSync.offset;
+    const absOffset = Math.abs(offset);
+    
+    // Update Transport Badge
+    const transport = audioPlayer.getTransportType();
+    if (transportBadge) {
+      transportBadge.textContent = transport;
+      transportBadge.className = `badge badge-${transport === 'UDP' ? 'success' : 'warning'}`;
+      transportBadge.title = transport === 'UDP' ? 'High-speed Low-latency UDP Path Active' : 'Fallback TCP Path Active (Higher Latency)';
+    }
 
     // Update sync ring
-    const offsetDisplay = document.getElementById('sync-offset-display');
     if (offsetDisplay) {
-      const offset = Math.abs(syncStats.avgOffset);
-      offsetDisplay.textContent = offset < 100 ? offset.toFixed(1) : Math.round(offset);
+      offsetDisplay.textContent = absOffset < 100 ? absOffset.toFixed(1) : Math.round(absOffset);
     }
 
     // Update ring color

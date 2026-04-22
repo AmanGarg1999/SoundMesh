@@ -62,39 +62,42 @@ class PlaybackWorklet extends AudioWorkletProcessor {
     const frameCount = left.length;
     const sampleRate = 48000; // Expected sample rate
 
-    // Current local time at start of this process block
-    const localNowMs = this.timeOrigin + (currentTime * 1000);
+    // Current shared time at start of this process block
+    const blockLocalStartTime = this.timeOrigin + (currentTime * 1000);
+    const msPerSample = 1000 / sampleRate;
 
     for (let i = 0; i < frameCount; i++) {
-      // 1. If we don't have a chunk, try to find the next one
-      if (!this.currentChunk) {
-        if (this.buffer.length > 0) {
-          // Check if it's time to play the next chunk
-          const frameSharedTime = this.getSharedTime(localNowMs + (i / sampleRate * 1000));
-          const nextChunk = this.buffer[0];
-          
-          // Simple lookahead: if we are within 20ms of target, start it
-          if (frameSharedTime >= nextChunk.targetPlayTime - 20) {
-            this.currentChunk = this.buffer.shift();
-            this.readOffset = 0;
-          }
-        }
-      }
+        // 1. Smoothly interpolate playback rate (Exp-Lerp)
+        // This prevents 'metallic clicks' during sync corrections by gliding the target speed.
+        this.actualRate = (this.actualRate * 0.99) + (this.playbackRate * 0.01);
 
-      // 2. Play sample if chunk is active
-      if (this.currentChunk) {
-        left[i] = this.currentChunk.data[this.readOffset++];
-        right[i] = this.currentChunk.data[this.readOffset++];
-
-        if (this.readOffset >= this.currentChunk.data.length) {
-          this.currentChunk = null;
-          this.readOffset = 0;
+        // 2. If we don't have a chunk, try to find the next one
+        if (!this.currentChunk) {
+            if (this.buffer.length > 0) {
+                const sampleSharedTime = this.getSharedTime(blockLocalStartTime + (i * msPerSample));
+                const nextChunk = this.buffer[0];
+                
+                if (sampleSharedTime >= nextChunk.targetPlayTime - 20) {
+                    this.currentChunk = this.buffer.shift();
+                    this.readOffset = 0;
+                }
+            }
         }
-      } else {
-        // Starvation/Waiting
-        left[i] = 0;
-        right[i] = 0;
-      }
+
+        // 3. Play sample if chunk is active
+        if (this.currentChunk) {
+            left[i] = this.currentChunk.data[this.readOffset++];
+            right[i] = this.currentChunk.data[this.readOffset++];
+
+            if (this.readOffset >= this.currentChunk.data.length) {
+                this.currentChunk = null;
+                this.readOffset = 0;
+            }
+        } else {
+            // Starvation/Waiting
+            left[i] = 0;
+            right[i] = 0;
+        }
     }
 
     return true;

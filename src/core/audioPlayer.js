@@ -1101,6 +1101,14 @@ class AudioPlayer extends EventEmitter {
       }
     });
   }
+
+  /**
+   * Determine current active binary transport type
+   * @returns {'UDP' | 'TCP'}
+   */
+  getTransportType() {
+    return webrtcManager.dataChannels.size > 0 ? 'UDP' : 'TCP';
+  }
 }
 
 export const audioPlayer = new AudioPlayer();

@@ -9,6 +9,7 @@ class WebRTCManager extends EventEmitter {
     super();
     this.peers = new Map(); // targetDeviceId -> RTCPeerConnection
     this.dataChannels = new Map(); // targetDeviceId -> RTCDataChannel
+    this.pendingCandidates = new Map(); // targetDeviceId -> RTCIceCandidate[]
     
     // Standard STUN servers for network traversal (mostly Local LAN usage though)
     this.iceConfig = {
@@ -79,6 +80,10 @@ class WebRTCManager extends EventEmitter {
       };
 
       await peer.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: signal.sdp }));
+      
+      // Flush pending candidates
+      this.flushCandidates(fromDeviceId);
+
       const answer = await peer.createAnswer();
       await peer.setLocalDescription(answer);
 
@@ -91,11 +96,30 @@ class WebRTCManager extends EventEmitter {
       console.log(`[WebRTC] Received answer from ${fromDeviceId}`);
       if (peer) {
         await peer.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: signal.sdp }));
+        this.flushCandidates(fromDeviceId);
       }
     } else if (signal.type === 'candidate') {
-      if (peer) {
+      if (peer && peer.remoteDescription) {
         await peer.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      } else {
+        // Queue candidate if peer exists but isn't ready
+        if (!this.pendingCandidates.has(fromDeviceId)) {
+          this.pendingCandidates.set(fromDeviceId, []);
+        }
+        this.pendingCandidates.get(fromDeviceId).push(signal.candidate);
       }
+    }
+  }
+
+  async flushCandidates(deviceId) {
+    const peer = this.peers.get(deviceId);
+    const candidates = this.pendingCandidates.get(deviceId);
+    if (peer && peer.remoteDescription && candidates) {
+      console.log(`[WebRTC] Flushing ${candidates.length} queued candidates for ${deviceId}`);
+      for (const cand of candidates) {
+        await peer.addIceCandidate(new RTCIceCandidate(cand)).catch(e => {});
+      }
+      this.pendingCandidates.delete(deviceId);
     }
   }
 
