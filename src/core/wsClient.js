@@ -10,9 +10,15 @@ class WSClient extends EventEmitter {
     super();
     this.ws = null;
     this.connected = false;
-    this.reconnectAttempts = 0;
-    this.deviceId = localStorage.getItem('soundmesh_device_id');
-    this.role = null; // 'host' or 'node'
+    // [Sync v6.2.6] Use sessionStorage to allow multiple tabs on the same machine
+    // to have unique IDs. localStorage causes "flicker" loops during development.
+    let id = sessionStorage.getItem('soundmesh_device_id');
+    if (!id) {
+      id = Math.random().toString(36).substring(2, 10);
+      sessionStorage.setItem('soundmesh_device_id', id);
+    }
+    this.deviceId = id;
+    this.role = null; 
   }
 
   /**
@@ -22,6 +28,8 @@ class WSClient extends EventEmitter {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    // [Sync v6.2.7] Use the same host/port as the page to ensure SSL cert compatibility.
+    // The previous 'flicker' issue was due to identity collision, not proxy throughput.
     const wsUrl = `${protocol}//${window.location.host}/ws`;
 
     console.log(`[WSClient] Connecting to ${wsUrl}...`);
@@ -50,6 +58,7 @@ class WSClient extends EventEmitter {
     this.ws.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
         // Binary audio data
+        if (Math.random() < 0.05) console.log(`[WSClient] Received binary data: ${event.data.byteLength} bytes`);
         this.emit('audio_data', event.data);
       } else {
         // JSON control message

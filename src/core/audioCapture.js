@@ -34,9 +34,10 @@ class AudioCapture extends EventEmitter {
     // Load worklet
     try {
       await this.audioContext.audioWorklet.addModule('/worklets/captureWorklet.js');
-      console.log('[AudioCapture] Capture worklet loaded');
+      console.log('[AudioCapture] Capture worklet loaded successfully from /worklets/captureWorklet.js');
     } catch (err) {
       console.error('[AudioCapture] Failed to load capture worklet:', err);
+      throw new Error('Critical: Audio Processing Worklet failed to load. If running in Docker, ensure the /worklets directory is mounted/included.');
     }
 
     // Create analyser for waveform visualization
@@ -68,10 +69,12 @@ class AudioCapture extends EventEmitter {
         await this.audioContext.resume();
       }
 
-      // Stop the video track immediately — we only want audio
+      // Disable the video track instead of stopping it — some browsers terminate the 
+      // entire stream (including audio) if the video track is stopped immediately.
       const videoTrack = this.mediaStream.getVideoTracks()[0];
       if (videoTrack) {
-        videoTrack.stop();
+        videoTrack.enabled = false;
+        console.log('[AudioCapture] Video track disabled (System Audio Mode)');
       }
 
       const audioTrack = this.mediaStream.getAudioTracks()[0];
@@ -216,6 +219,17 @@ class AudioCapture extends EventEmitter {
 
         // Convert float32 to int16 for efficient transport
         const chunkInt16 = float32ToInt16(samples);
+        
+        // Diagnostic: Check peak volume
+        let peak = 0;
+        for (let i = 0; i < samples.length; i++) {
+          const abs = Math.abs(samples[i]);
+          if (abs > peak) peak = abs;
+        }
+        
+        if (this.sequenceNumber % 100 === 0) {
+          console.log(`[AudioCapture] Emitting chunk #${this.sequenceNumber} | Peak: ${peak.toFixed(4)}`);
+        }
 
         // Emit the chunk
         this.emit('audio_chunk', {
@@ -227,7 +241,11 @@ class AudioCapture extends EventEmitter {
       }
     };
 
-    // Tell worklet to start
+    // Tell worklet to configure and start
+    this.workletNode.port.postMessage({
+      type: 'config',
+      payload: { bufferSize: SAMPLES_PER_CHUNK }
+    });
     this.workletNode.port.postMessage({ type: 'start' });
 
     // Connect: Source → Worklet → Analyser → Silent Destination

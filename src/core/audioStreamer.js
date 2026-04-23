@@ -7,6 +7,7 @@ import { clockSync } from './clockSync.js';
 import { audioCapture } from './audioCapture.js';
 import { HEADER_SIZE, CHUNK_DURATION_MS } from '../utils/constants.js';
 import { EventEmitter } from '../utils/helpers.js';
+import { appState } from '../main.js';
 
 class AudioStreamer extends EventEmitter {
   constructor() {
@@ -27,6 +28,7 @@ class AudioStreamer extends EventEmitter {
   start() {
     if (this.isStreaming) return;
 
+    console.log('[AudioStreamer] Starting audio broadcast (UDP Only)...');
     audioCapture.on('audio_chunk', this.handleChunk);
     this.isStreaming = true;
     this.chunksSent = 0;
@@ -99,11 +101,16 @@ class AudioStreamer extends EventEmitter {
 
     // Calculate target play time analytically
     // By anchoring to the first chunk, we completely eliminate event-loop jitter from our timestamps
-    if (this.baseSequence === null) {
+    // [Sync v6.2.2] Periodic Re-Anchoring
+    // Every 1000 chunks, we re-anchor our analytic timestamps to the real clock.
+    // This prevents long-term drift from accumulating if the hardware sample rate 
+    // is slightly different than the theoretical 48000Hz.
+    if (this.baseSequence === null || seq % 1000 === 0) {
       this.baseSequence = seq;
       // Add extra padding for Opus encoder lookahead/processing
       const codecPadding = this.useOpus ? 20 : 0;
       this.baseSharedTime = clockSync.getSharedTime() + clockSync.getGlobalBuffer() + codecPadding;
+      if (seq > 0) console.log(`[AudioStreamer] Re-anchored sync at seq ${seq}`);
     }
 
     const targetPlayTime = this.baseSharedTime + ((seq - this.baseSequence) * CHUNK_DURATION_MS);
@@ -115,6 +122,15 @@ class AudioStreamer extends EventEmitter {
         // WE MUST USE ROUNDED INTEGERS for WebCodecs timestamps to avoid Map lookup failures
         const timestamp = Math.round(targetPlayTime * 1000); // rounded microseconds
         this.seqMap.set(timestamp, seq);
+        
+        // Diagnostic: Peak volume tracking
+        const int16 = new Int16Array(pcmData.buffer);
+        let peak = 0;
+        for (let i = 0; i < int16.length; i++) {
+            const abs = Math.abs(int16[i]);
+            if (abs > peak) peak = abs;
+        }
+        if (seq % 100 === 0) console.log(`[AudioStreamer] Encoding chunk #${seq} | Peak: ${peak}`);
 
         const audioData = new AudioData({
           format: 's16',
@@ -168,12 +184,20 @@ class AudioStreamer extends EventEmitter {
     packet.set(new Uint8Array(header), 0);
     packet.set(new Uint8Array(data), HEADER_SIZE);
 
-    // [Sync v6.0] Broadcast via WebRTC DataChannel (UDP Mode)
-    // This eliminates TCP Head-of-Line blocking for binary audio data.
-    webrtcManager.broadcast(packet.buffer);
+    // [Sync v6.2.3] Hybrid Relay Logic
+    // We prefer WebRTC (UDP) for lower latency, but we fallback to WebSocket (TCP)
+    // if no WebRTC channels are open or if the user requested extra reliability.
+    const sentViaUDP = webrtcManager.broadcast(packet.buffer);
     
-    // Also send via WebSocket as fallback for stability if no WebRTC peers are ready
-    if (webrtcManager.dataChannels.size === 0) {
+    if (this.chunksSent % 100 === 0) {
+      console.log(`[AudioStreamer] Chunk #${seq} | UDP reached: ${sentViaUDP} nodes | WS fallback: ${sentViaUDP === 0 || appState.devices.length > 1}`);
+    }
+    
+    // Always send via WebSocket if UDP reached 0 nodes, OR if we want to ensure
+    // every node gets the chunk even if their UDP is firewalled.
+    // [Optimization] Only send via WS if nodes are actually connected to the server.
+    if (sentViaUDP === 0 || appState.devices.length > 1) {
+      if (Math.random() < 0.01) console.log('[AudioStreamer] Sending chunk via WebSocket fallback');
       wsClient.sendBinary(packet.buffer);
     }
 

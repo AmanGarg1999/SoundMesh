@@ -46,6 +46,8 @@ class AudioPlayer extends EventEmitter {
     this.schedulerWorker = null;
     this.mediaStreamDestination = null;
     this.tetherAudio = null;
+    this.watchdogInterval = null;
+    this.workletFallbackActive = false;
 
     // Multi-Output Support
     this.enabledSinkIds = new Set(JSON.parse(localStorage.getItem('soundmesh_enabled_sinks') || '["default"]'));
@@ -68,25 +70,56 @@ class AudioPlayer extends EventEmitter {
     this.workletNode = null;
     this.heartbeatOsc = null;
     this.heartbeatGain = null;
+    this.initPromise = null; // Initialization singleton guard
   }
 
   /**
-   * Initialize the audio player
+   * Internal: Initialize the AudioContext and required nodes
    */
   async init() {
-    if (this.audioContext) return;
+    if (this.initPromise) return this.initPromise;
 
-    // Detect platform for latencyHint optimization
-    const ua = navigator.userAgent.toLowerCase();
-    this.isAndroid = ua.includes('android');
-    this.isIOS = /iphone|ipad|ipod/.test(ua);
+    this.initPromise = (async () => {
+      console.log('[AudioPlayer] init() called');
+      if (this.audioContext) {
+        console.log('[AudioPlayer] Already initialized');
+        return;
+      }
 
-    // Android benefits from 'interactive' hint (shorter buffer = less pipeline delay)
-    // Apple devices work best with 'playback' (stable, long buffers)
-    const hint = this.isAndroid ? 'interactive' : 'playback';
+      // Detect platform for latencyHint optimization
+      const ua = navigator.userAgent.toLowerCase();
+      this.isAndroid = ua.includes('android');
+      this.isIOS = /iphone|ipad|ipod/.test(ua);
 
-    this.audioContext = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: hint });
-    this.audioContext.onstatechange = () => console.log('[AudioPlayer] Native state:', this.audioContext.state);
+      // Android benefits from 'interactive' hint (shorter buffer = less pipeline delay)
+      // Apple devices work best with 'playback' (stable, long buffers)
+      const hint = this.isAndroid ? 'interactive' : 'playback';
+
+      this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+        latencyHint: hint,
+        sampleRate: SAMPLE_RATE,
+      });
+      
+      console.log(`[AudioPlayer] AudioContext created. State: ${this.audioContext.state}, Latency: ${(this.audioContext.outputLatency*1000).toFixed(1)}ms`);
+
+      // [Sync v6.0] Listen for audio data
+      this.webrtcListener = (data) => {
+        if (this.isPlaying) this.receiveChunk(data);
+      };
+      this.wsListener = (data) => {
+        // [Sync v6.2.1] Robust Fallback Logic: Always process WebSocket audio.
+        // The JitterBuffer handles duplicate detection (sequence number checks),
+        // so we can safely accept both UDP and TCP packets. This ensures audio
+        // continues even if WebRTC is "Open" but firewalled.
+        if (this.isPlaying) {
+          this.receiveChunk(data);
+        }
+      };
+
+      webrtcManager.on('audio_data', this.webrtcListener);
+      wsClient.on('audio_data', this.wsListener);
+
+      this.audioContext.onstatechange = () => console.log('[AudioPlayer] Native state:', this.audioContext.state);
 
     // Create gain node for volume control
     this.gainNode = this.audioContext.createGain();
@@ -100,11 +133,8 @@ class AudioPlayer extends EventEmitter {
     // [Sync v3.1] Each output device now gets its own subgraph connected to GainNode
     console.log('[AudioPlayer] Ready for multi-sink routing');
 
-    // [Reliability] Clock Anchor: Create a silent tether to the hardware destination
-    const anchor = this.audioContext.createGain();
-    anchor.gain.value = 0;
-    this.gainNode.connect(anchor);
-    anchor.connect(this.audioContext.destination);
+    // [Reliability] Restore direct hardware path as baseline to prevent silence on mobile
+    this.gainNode.connect(this.audioContext.destination);
 
     // [iOS v6.1] Ultrasonic Persistence Heartbeat
     // We play a 15,500Hz sine wave at very low volume
@@ -121,13 +151,6 @@ class AudioPlayer extends EventEmitter {
       this.heartbeatOsc.start();
       console.log('[AudioPlayer] Inaudible ultrasonic heartbeat active (iOS Survival)');
     } catch (e) {}
-
-    // Resume context on visibility change
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible' && this.audioContext.state === 'suspended') {
-        this.audioContext.resume();
-      }
-    });
 
     // ── Platform-Aware Output Latency ──
     // Android Chrome frequently reports 0ms for both outputLatency and baseLatency,
@@ -149,17 +172,65 @@ class AudioPlayer extends EventEmitter {
       this.outputLatency = measuredLatency;
     }
 
-    // [Sync v6.0] Load High-Priority Playback Worklet
     try {
-      await this.audioContext.audioWorklet.addModule(new URL('./playbackWorklet.js', import.meta.url));
-      this.workletNode = new AudioWorkletNode(this.audioContext, 'playback-worklet');
+      await this.audioContext.audioWorklet.addModule(`/worklets/playbackWorklet.js?v=${Date.now()}`);
+      console.log('[AudioPlayer] Playback worklet loaded successfully from /worklets/playbackWorklet.js');
+      this.workletNode = new AudioWorkletNode(this.audioContext, 'playback-worklet', {
+        outputChannelCount: [2]
+      });
       this.workletNode.connect(this.analyserNode);
+
+      // Configure Worklet with current protocol settings
+      this.workletNode.port.postMessage({
+        type: 'config',
+        payload: { 
+          samplesPerChunk: SAMPLES_PER_CHUNK,
+          chunkDurationMs: CHUNK_DURATION_MS,
+          sampleRate: SAMPLE_RATE
+        }
+      });
+      
+      this.updateWorkletClock(); // Initial sync
+      
+      this.workletNode.port.onmessage = (e) => {
+        if (e.data.type === 'heartbeat') {
+          this.lastWorkletHeartbeat = Date.now();
+        }
+      };
+      
       console.log('[AudioPlayer] PlaybackWorklet active (High Priority Mode)');
     } catch (e) {
-      console.error('[AudioPlayer] Failed to load AudioWorklet:', e);
+      console.error('[AudioPlayer] Failed to load PlaybackWorklet:', e);
+      this.workletNode = null;
     }
 
-    console.log(`[AudioPlayer] Initialized (${this.isAndroid ? 'Android' : this.isIOS ? 'iOS' : 'Desktop'}). Output latency: ${(this.outputLatency * 1000).toFixed(1)}ms`);
+      console.log(`[AudioPlayer] Initialized (${this.isAndroid ? 'Android' : this.isIOS ? 'iOS' : 'Desktop'}). Output latency: ${(this.outputLatency * 1000).toFixed(1)}ms`);
+      
+      // Worklet status
+      if (this.workletNode) {
+        console.log('[AudioPlayer] ✅ PlaybackWorklet ACTIVE');
+      } else {
+        console.warn('[AudioPlayer] ❌ PlaybackWorklet FAILED - using BufferSource fallback');
+      }
+      
+      return true;
+    })();
+
+    return this.initPromise;
+  }
+
+  /**
+   * Cleanup network listeners to prevent memory leaks during role switches
+   */
+  uninitListeners() {
+    if (this.webrtcListener) {
+      webrtcManager.off('audio_data', this.webrtcListener);
+      this.webrtcListener = null;
+    }
+    if (this.wsListener) {
+      wsClient.off('audio_data', this.wsListener);
+      this.wsListener = null;
+    }
   }
 
   /**
@@ -462,6 +533,12 @@ class AudioPlayer extends EventEmitter {
    * Start playback — begin scheduling buffers from the jitter buffer
    */
   async start() {
+    // Idempotent: safe to call multiple times
+    if (this.isPlaying) {
+      console.log('[AudioPlayer] Already playing (idempotent)');
+      return;
+    }
+
     await this.init();
 
     if (this.audioContext.state === 'suspended') {
@@ -482,16 +559,6 @@ class AudioPlayer extends EventEmitter {
     if (this.workletNode) {
       this.workletNode.port.postMessage({ type: 'start' });
     }
-
-    // [Sync v6.0] Listen for WebRTC audio data (UDP Path)
-    webrtcManager.on('audio_data', (data) => this.receiveChunk(data));
-    
-    // Fallback: Listen for WebSocket data only if no WebRTC peers are ready
-    wsClient.on('audio_data', (data) => {
-      if (webrtcManager.dataChannels.size === 0) {
-        this.receiveChunk(data);
-      }
-    });
 
     // Start scheduler via Web Worker (Bypasses background throttling)
     if (!this.schedulerWorker) {
@@ -515,8 +582,8 @@ class AudioPlayer extends EventEmitter {
     // [Insomnia] Activate high-priority sleep prevention
     await insomnia.activate();
 
-    // Request screen wake lock
-    // Handled by insomnia.activate()
+    // Start health watchdog (handles mobile suspension)
+    this.startWatchdog();
 
     console.log('[AudioPlayer] Started');
     this.emit('playback_started');
@@ -559,6 +626,7 @@ class AudioPlayer extends EventEmitter {
     this.driftIntegral = 0;
     this.isFirstChunk = true;
     this.nextScheduledTime = 0;
+    this.stopWatchdog();
 
     if (this.wakeLock) {
       insomnia.deactivate();
@@ -583,13 +651,26 @@ class AudioPlayer extends EventEmitter {
    * Receive a binary audio packet from the WebSocket
    */
   receiveChunk(arrayBuffer) {
-    if (!this.isPlaying) return;
+    console.log(`[AudioPlayer] receiveChunk() called. isPlaying: ${this.isPlaying}, size: ${arrayBuffer.byteLength}`);
+    
+    if (!this.isPlaying) {
+      if (!this.dropLogCount) this.dropLogCount = 0;
+      this.dropLogCount++;
+      if (this.dropLogCount <= 5) {
+        console.warn(`[AudioPlayer] Dropped chunk (not playing). Count: ${this.dropLogCount}`);
+      }
+      return;
+    }
+    delete this.dropLogCount;
 
     try {
       const view = new DataView(arrayBuffer);
-      
-      // Parse 16-byte header
       const seq = view.getUint32(0, true);
+      
+      if (seq % 100 === 0) {
+        console.log(`[AudioPlayer] RECEIVED Chunk #${seq} | Size: ${arrayBuffer.byteLength} bytes | Buff: ${this.jitterBuffer.size()}`);
+      }
+      
       const targetPlayTime = view.getFloat64(4, true);
       const channelMask = view.getUint16(12, true);
       const flags = view.getUint16(14, true);
@@ -736,9 +817,12 @@ class AudioPlayer extends EventEmitter {
         break;
       }
 
-      const timeUntilPlayMs = chunk.targetPlayTime - sharedTimeNow;
+      const timeUntilPlayMs = chunk.timestamp - sharedTimeNow;
+      
+      if (scheduled === 0 && this.chunksPlayed % 50 === 0) {
+        console.log(`[AudioPlayer] Next chunk #${chunk.seq} | timeUntilPlay: ${timeUntilPlayMs.toFixed(1)}ms | Thresholds: [${staleThresholdMs}, ${futureThresholdMs}] | Context: ${this.audioContext.state}`);
+      }
 
-      // If this chunk is too far in the future, wait
       if (timeUntilPlayMs > futureThresholdMs) {
         break;
       }
@@ -864,8 +948,10 @@ class AudioPlayer extends EventEmitter {
       const leftChannel = audioBuffer.getChannelData(0);
       const rightChannel = audioBuffer.getChannelData(1);
       for (let i = 0; i < SAMPLES_PER_CHUNK; i++) {
-        let l = chunk.pcmData[i * 2] || 0;
-        let r = chunk.pcmData[i * 2 + 1] || 0;
+        // [Sync v6.2.8] Normalize Int16 to Float32 (-1.0 to 1.0)
+        // This is critical. WebAudio outputs will clip or stay silent if fed raw Int16.
+        let l = (chunk.pcmData[i * 2] || 0) / 32768;
+        let r = (chunk.pcmData[i * 2 + 1] || 0) / 32768;
 
         if (this.surroundMask === 'left') r = 0;
         else if (this.surroundMask === 'right') l = 0;
@@ -873,13 +959,19 @@ class AudioPlayer extends EventEmitter {
           const mix = (l + r) * 0.707;
           l = mix; r = mix;
         } else if (this.surroundMask === 'lfe') {
-          // Bass extraction stub (use lowpass in reality, but just mono mix here)
           const mix = (l + r) * 0.707;
           l = mix; r = mix;
         }
 
         leftChannel[i] = l;
         rightChannel[i] = r;
+      }
+
+      // [Sync v6.2.9] Prepare Float32 view for Worklet transfer
+      const floatData = new Float32Array(leftChannel.length + rightChannel.length);
+      for (let i = 0; i < leftChannel.length; i++) {
+        floatData[i * 2] = leftChannel[i];
+        floatData[i * 2 + 1] = rightChannel[i];
       }
 
       // Schedule gapless playback
@@ -897,18 +989,19 @@ class AudioPlayer extends EventEmitter {
         source.disconnect();
       };
 
+      const actualPlayAt = Math.max(this.nextScheduledTime, now);
+
       // [Sync v6.0] Transfer to High-Priority AudioWorklet
-      if (this.workletNode) {
+      if (this.workletNode && !this.workletFallbackActive) {
         this.workletNode.port.postMessage({
-          type: 'push_chunk', // Match worklet's expectation
+          type: 'push_chunk', 
           payload: {
-            data: chunk.pcmData,
-            targetPlayTime: absolutePlayAt * 1000 // In ms for worklet
+            data: floatData,
+            targetPlayTime: clockSync.toSharedTime(actualPlayAt * 1000)
           }
         });
       } else {
-        // Fallback to legacy scheduling if Worklet failed
-        const actualPlayAt = Math.max(this.nextScheduledTime, now);
+        // Fallback to legacy scheduling
         source.start(actualPlayAt);
       }
 
@@ -916,10 +1009,6 @@ class AudioPlayer extends EventEmitter {
       const chunkDuration = SAMPLES_PER_CHUNK / SAMPLE_RATE;
       const nextTime = actualPlayAt + (chunkDuration / rate);
       this.nextScheduledTime = Math.round(nextTime / sampleStep) * sampleStep;
-
-      // Track drift for stats
-      const idealPlayTime = now + (timeUntilPlayMs / 1000);
-      this.syncDrift = (actualPlayAt - idealPlayTime) * 1000;
 
       this.chunksPlayed++;
       this.lastScheduledSeq = chunk.seq;
@@ -1097,17 +1186,57 @@ class AudioPlayer extends EventEmitter {
         offset: clockSync.offset,
         skew: clockSync.skew,
         lastSyncTime: clockSync.lastSyncTime,
-        timeOrigin: performance.timeOrigin
+        timeOrigin: performance.timeOrigin,
+        performanceNow: performance.now(),
+        audioContextTime: this.audioContext.currentTime * 1000
       }
     });
+  }
+
+  /**
+   * Monitor AudioContext state and attempt to resume if suspended while playing.
+   * This is critical for mobile browsers that aggressively pause JS threads.
+   */
+  startWatchdog() {
+    if (this.watchdogInterval) return;
+    
+    this.watchdogInterval = setInterval(() => {
+      const now = Date.now();
+      
+      // 1. AudioContext Health
+      if (this.isPlaying && this.audioContext && this.audioContext.state === 'suspended') {
+        console.warn('[AudioPlayer] Watchdog detected suspension. Attempting resume...');
+        this.audioContext.resume().catch(e => console.error('[AudioPlayer] Watchdog resume failed:', e));
+      }
+
+      // 2. Worklet Health (Heartbeat check)
+      if (this.isPlaying && this.workletNode) {
+        const timeSinceLastHeartbeat = now - (this.lastWorkletHeartbeat || 0);
+        if (timeSinceLastHeartbeat > 3000 && (now - this.lastCalibrationTime > 5000)) {
+          console.error(`[AudioPlayer] Worklet stall detected (${timeSinceLastHeartbeat}ms). Falling back to Legacy Scheduling.`);
+          // We don't nullify the node (to allow recovery), but we can toggle a flag
+          this.workletFallbackActive = true;
+        } else {
+          this.workletFallbackActive = false;
+        }
+      }
+    }, 2000);
+  }
+
+  stopWatchdog() {
+    if (this.watchdogInterval) {
+      clearInterval(this.watchdogInterval);
+      this.watchdogInterval = null;
+    }
   }
 
   /**
    * Determine current active binary transport type
    * @returns {'UDP' | 'TCP'}
    */
-  getTransportType() {
-    return webrtcManager.dataChannels.size > 0 ? 'UDP' : 'TCP';
+  determineTransportType() {
+    const hasOpenUDP = Array.from(webrtcManager.dataChannels.values()).some(dc => dc.readyState === 'open');
+    return hasOpenUDP ? 'UDP' : 'NONE (TCP Disabled)';
   }
 }
 

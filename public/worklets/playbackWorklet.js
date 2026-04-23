@@ -81,70 +81,71 @@ class PlaybackWorklet extends AudioWorkletProcessor {
       const frameCount = left.length;
       const msPerSample = 1000 / sampleRate;
 
-      // [Sync v6.2.2] Re-anchor local time to Unix Absolute Time
-      // This is CRITICAL. blockLocalStartTime must be in the same domain as this.lastSyncTime (Unix ms).
+      // [Sync v6.2] Re-anchor local time to system clock (Unix Epoch)
+      // AudioContext 'currentTime' stops during suspension, but performance.now() doesn't.
+      // This formula aligns 'currentTime' back into the shared absolute Unix time domain.
       const localAudioTimeMs = currentTime * 1000;
       const systemTimeElapsed = localAudioTimeMs - (this.audioContextTime || 0);
-      const hostPerformanceNow = this.performanceNow || 0; 
-      const blockLocalStartTime = (this.timeOrigin || 0) + hostPerformanceNow + systemTimeElapsed;
+      const blockLocalStartTime = (this.timeOrigin || 0) + (this.performanceNow || 0) + systemTimeElapsed;
 
       for (let i = 0; i < frameCount; i++) {
-          // 1. Smoothly interpolate playback rate (Exp-Lerp)
-          this.actualRate = (this.actualRate * 0.99) + (this.playbackRate * 0.01);
+        // 1. Smoothly interpolate playback rate (Exp-Lerp)
+        this.actualRate = (this.actualRate * 0.99) + (this.playbackRate * 0.01);
 
-          // 2. If we don't have a chunk, try to find the next one
-          if (!this.currentChunk) {
-              const sampleSharedTime = this.getSharedTime(blockLocalStartTime + (i * msPerSample));
-              
-              // Skip multiple chunks if they are all in the past (Catch-up logic)
-              while (this.buffer.length > 0) {
-                  const nextChunk = this.buffer[0];
-                  // Allow a 40ms jitter window for stability
-                  if (sampleSharedTime >= nextChunk.targetPlayTime - 40) {
-                      this.currentChunk = this.buffer.shift();
-                      this.readOffset = 0;
-                      
-                      // If this chunk is already mostly played by our current sample clock, 
-                      // skip further to catch up if we have more chunks
-                      if (sampleSharedTime > nextChunk.targetPlayTime + 40 && this.buffer.length > 0) {
-                        continue; // Try next chunk
-                      }
-                      break; 
-                  } else {
-                    break; // Next chunk is in the future
-                  }
-              }
+        // 2. If we don't have a chunk, try to find the next one
+        if (!this.currentChunk && this.buffer.length > 0) {
+          const sampleLocalTime = blockLocalStartTime + (i * msPerSample);
+          const sampleSharedTime = this.getSharedTime(sampleLocalTime);
+
+          // Find the right chunk or skip late ones
+          while (this.buffer.length > 0) {
+            const nextChunk = this.buffer[0];
+            // [Sync v6.5] Catch-up Logic
+            // If the chunk is more than 500ms in the past, skip it immediately
+            if (sampleSharedTime > nextChunk.targetPlayTime + 500) {
+              this.buffer.shift();
+              continue;
+            }
+            // Allow 100ms jitter window for clock sync tolerance
+            if (sampleSharedTime >= nextChunk.targetPlayTime - 100) {
+              this.currentChunk = this.buffer.shift();
+              this.readOffset = 0;
+              break;
+            }
+            // If it's too early for the first chunk, wait
+            break;
           }
+        }
 
-          // 3. Play sample if chunk is active
-          if (this.currentChunk && this.currentChunk.data) {
-              const intOffset = Math.floor(this.readOffset);
-              const dataIdx = intOffset * 2;
+        // 3. Play sample if chunk is active
+        if (this.currentChunk && this.currentChunk.data) {
+          const intOffset = Math.floor(this.readOffset);
+          const dataIdx = intOffset * 2;
 
-              // Bounds check for safety
-              if (dataIdx >= 0 && dataIdx + 1 < this.currentChunk.data.length) {
-                left[i] = this.currentChunk.data[dataIdx];
-                right[i] = this.currentChunk.data[dataIdx + 1];
-              } else {
-                left[i] = 0;
-                right[i] = 0;
-              }
-
-              this.readOffset += this.actualRate;
-
-              if (this.readOffset >= this.currentChunk.data.length / 2) {
-                  this.currentChunk = null;
-                  this.readOffset = 0;
-              }
+          // Bounds check for safety
+          if (dataIdx >= 0 && dataIdx + 1 < this.currentChunk.data.length) {
+            left[i] = this.currentChunk.data[dataIdx];
+            right[i] = this.currentChunk.data[dataIdx + 1];
           } else {
-              // Starvation/Waiting
-              left[i] = 0;
-              right[i] = 0;
+            left[i] = 0;
+            right[i] = 0;
           }
+
+          this.readOffset += this.actualRate;
+
+          if (this.readOffset >= this.currentChunk.data.length / 2) {
+            this.currentChunk = null;
+            this.readOffset = 0;
+          }
+        } else {
+          // Starvation/Waiting
+          left[i] = 0;
+          right[i] = 0;
+        }
       }
     } catch (err) {
       // Prevent entire audio thread from crashing on single error
-      console.error('[PlaybackWorklet] Process error:', err);
+      try { console.error('[PlaybackWorklet] Process error:', err); } catch (e) {}
     }
 
     return true;

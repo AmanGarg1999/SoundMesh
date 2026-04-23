@@ -861,7 +861,7 @@ function startStatsUpdater() {
     const absOffset = Math.abs(offset);
     
     // Update Transport Badge
-    const transport = audioPlayer.getTransportType();
+    const transport = audioPlayer.determineTransportType();
     if (transportBadge) {
       transportBadge.textContent = transport;
       transportBadge.className = `badge badge-${transport === 'UDP' ? 'success' : 'warning'}`;

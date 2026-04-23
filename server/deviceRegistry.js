@@ -9,6 +9,9 @@ export class DeviceRegistry {
     this.wsMap = new Map();   // deviceId → WebSocket
     this.roomPin = Math.floor(1000 + Math.random() * 9000).toString();
     console.log(`[DeviceRegistry] Security PIN initialized: ${this.roomPin}`);
+
+    // Prune zombies (disconnected devices) every 2 minutes
+    setInterval(() => this.pruneZombies(), 120000);
   }
 
   /**
@@ -28,13 +31,9 @@ export class DeviceRegistry {
       }
     }
 
-    // Secondary cleanup: If this WebSocket is somehow already registered to a different deviceId
-    for (const [id, socket] of this.wsMap.entries()) {
-      if (socket === ws && id !== deviceId) {
-        console.log(`[DeviceRegistry] Cleaning up mismatched registration for device: ${id}`);
-        this.unregister(id);
-      }
-    }
+    // Secondary cleanup: Ensure this WebSocket is truly unique in our registries
+    // Attach deviceId directly to socket for O(1) cleanup later
+    ws.deviceId = deviceId;
 
     let isReconnection = false;
     // If deviceId provided and exists, handle as reconnection
@@ -97,6 +96,7 @@ export class DeviceRegistry {
       device.ip = info.ip || device.ip;
       device.userAgent = info.userAgent || device.userAgent;
       device.connected = true;
+      device.lastSeen = Date.now();
     }
 
     this.devices.set(deviceId, device);
@@ -109,7 +109,25 @@ export class DeviceRegistry {
     const device = this.devices.get(deviceId);
     if (device) {
       device.connected = false;
+      device.disconnectedAt = Date.now(); // Track for pruning
     }
+  }
+
+  /**
+   * Remove devices that have been disconnected for too long (5 minutes)
+   */
+  pruneZombies() {
+    const NOW = Date.now();
+    const MAX_ZOMBIE_AGE = 300000; // 5 minutes
+
+    let pruned = 0;
+    for (const [id, device] of this.devices.entries()) {
+      if (!device.connected && (NOW - (device.disconnectedAt || device.connectedAt)) > MAX_ZOMBIE_AGE) {
+        this.devices.delete(id);
+        pruned++;
+      }
+    }
+    if (pruned > 0) console.log(`[DeviceRegistry] Pruned ${pruned} zombie device(s)`);
   }
 
   update(deviceId, updates) {

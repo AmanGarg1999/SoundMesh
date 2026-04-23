@@ -44,8 +44,22 @@ function init() {
     // Render appropriate view
     if (appState.role === 'host') {
       navigateTo('host');
+      
+      // [Sync v6.4] Host Catch-up: Connect to all nodes already in the session
+      console.log(`[App] Host connected (${appState.deviceId}). Initiating catch-up for existing nodes...`);
+      appState.devices.forEach(device => {
+        // Strictly only connect to other nodes, never to ourselves
+        if (device.role === 'node' && device.deviceId !== appState.deviceId) {
+          webrtcManager.initConnection(device.deviceId);
+        }
+      });
     } else {
       navigateTo('node');
+    }
+    // [Sync v6.2.4] Auto-start if host is already playing
+    if (appState.role === 'node' && appState.session?.playbackState?.isPlaying) {
+      console.log('[App] Host is already streaming. Auto-starting player.');
+      audioPlayer.start().catch(err => console.error('[App] Auto-start failed:', err));
     }
   });
 
@@ -107,10 +121,19 @@ function init() {
 
   // Handle playback state changes from host (start/stop streaming)
   wsClient.on('playback_state_changed', async (payload) => {
+    console.log('[DEBUG] playback_state_changed:', payload);
     if (appState.role === 'node') {
       if (payload.isPlaying) {
-        console.log('[App] Host started streaming');
+        console.log('[App] Host started streaming - STARTING AUDIO PLAYER');
         appState.isAudioActive = true;
+        try {
+          await audioPlayer.start();
+          console.log('[App] audioPlayer.start() COMPLETED SUCCESSFULLY');
+          showToast('🎵 Audio streaming started', 'success');
+        } catch (err) {
+          console.error('[App] audioPlayer.start() FAILED:', err);
+          showToast('❌ Audio start failed: ' + err.message, 'error');
+        }
       } else {
         console.log('[App] Host stopped streaming');
         appState.isAudioActive = false;
@@ -120,13 +143,8 @@ function init() {
     }
   });
 
-  // Handle audio data (all roles can listen if they want loopback)
-  wsClient.on('audio_data', (arrayBuffer) => {
-    // Only process if the player is active
-    if (audioPlayer.isPlaying) {
-      audioPlayer.receiveChunk(arrayBuffer);
-    }
-  });
+  // [Optimization] Audio data is now handled exclusively by audioPlayer.js
+  // to prevent duplicate processing and memory leaks.
 
   // Handle volume commands from host
   wsClient.on('set_volume', ({ volume }) => {
@@ -233,21 +251,24 @@ export function navigateTo(page) {
 }
 
 // ── UI Refresh ──
-let refreshTimeout;
+let isRefreshPending = false;
 export function refreshUI() {
-  clearTimeout(refreshTimeout);
-  refreshTimeout = setTimeout(() => {
-    // Re-render current page
+  if (isRefreshPending) return;
+  isRefreshPending = true;
+
+  // [Optimization] Use requestAnimationFrame for 60FPS capped rendering
+  requestAnimationFrame(() => {
+    isRefreshPending = false;
+    
     switch (appState.currentPage) {
       case 'host':
-        // Only update dynamic parts
         updateDeviceList();
         break;
       case 'node':
         updateNodeStatus();
         break;
     }
-  }, 50);
+  });
 }
 
 function updateDeviceList() {

@@ -24,9 +24,16 @@ class WebRTCManager extends EventEmitter {
    * Node: Initiate connection to Host
    */
   async initConnection(targetDeviceId) {
-    if (this.peers.has(targetDeviceId)) return;
+    if (this.peers.has(targetDeviceId)) {
+      const peer = this.peers.get(targetDeviceId);
+      if (peer.connectionState === 'connected' || peer.connectionState === 'connecting') {
+        console.log(`[WebRTC] Connection to ${targetDeviceId} already exists or is in progress. Skipping.`);
+        return;
+      }
+      this.cleanup(targetDeviceId);
+    }
 
-    console.log(`[WebRTC] Initiating connection to ${targetDeviceId}`);
+    console.log(`[WebRTC] Initiating connection to ${targetDeviceId}...`);
     const peer = new RTCPeerConnection(this.iceConfig);
     this.peers.set(targetDeviceId, peer);
 
@@ -37,12 +44,29 @@ class WebRTCManager extends EventEmitter {
     });
     this.setupDataChannel(targetDeviceId, dc);
 
+    peer.oniceconnectionstatechange = () => {
+      console.log(`[WebRTC] ICE state with ${targetDeviceId}: ${peer.iceConnectionState}`);
+      if (['failed', 'disconnected', 'closed'].includes(peer.iceConnectionState)) {
+        this.cleanup(targetDeviceId);
+      }
+    };
+
     peer.onicecandidate = (event) => {
       if (event.candidate) {
+        console.log(`[WebRTC] ICE Candidate gathered for ${targetDeviceId}: ${event.candidate.candidate.substring(0, 40)}...`);
         wsClient.send('webrtc_signal', {
           targetDeviceId,
           signal: { type: 'candidate', candidate: event.candidate }
         });
+      }
+    };
+
+    peer.onconnectionstatechange = () => {
+      console.log(`[WebRTC] Connection state with ${targetDeviceId}: ${peer.connectionState}`);
+      if (peer.connectionState === 'connected') {
+        this.emit('connected', targetDeviceId);
+      } else if (['failed', 'disconnected', 'closed'].includes(peer.connectionState)) {
+        this.cleanup(targetDeviceId);
       }
     };
 
@@ -66,8 +90,16 @@ class WebRTCManager extends EventEmitter {
       peer = new RTCPeerConnection(this.iceConfig);
       this.peers.set(fromDeviceId, peer);
 
+      peer.oniceconnectionstatechange = () => {
+        console.log(`[WebRTC] ICE state with ${fromDeviceId}: ${peer.iceConnectionState}`);
+        if (['failed', 'disconnected', 'closed'].includes(peer.iceConnectionState)) {
+          this.cleanup(fromDeviceId);
+        }
+      };
+
       peer.onicecandidate = (event) => {
         if (event.candidate) {
+          console.log(`[WebRTC] ICE Candidate gathered for ${fromDeviceId}: ${event.candidate.candidate.substring(0, 40)}...`);
           wsClient.send('webrtc_signal', {
             targetDeviceId: fromDeviceId,
             signal: { type: 'candidate', candidate: event.candidate }
@@ -127,19 +159,23 @@ class WebRTCManager extends EventEmitter {
     dc.binaryType = 'arraybuffer';
     
     dc.onopen = () => {
-      console.log(`[WebRTC] DataChannel open with ${deviceId}`);
+      console.log(`[WebRTC] DataChannel OPEN with ${deviceId} (${dc.label})`);
       this.dataChannels.set(deviceId, dc);
       this.emit('connection_ready', deviceId);
+      this.emit('channel_open', deviceId);
     };
 
     dc.onmessage = (event) => {
+      if (Math.random() < 0.01) { // Log 1% of packets to avoid console spam
+        console.log(`[WebRTC] Received binary chunk (${event.data.byteLength} bytes) from ${deviceId}`);
+      }
       this.emit('audio_data', event.data);
     };
 
     dc.onclose = () => {
-      console.log(`[WebRTC] DataChannel closed with ${deviceId}`);
+      console.log(`[WebRTC] DataChannel CLOSED with ${deviceId}`);
       this.dataChannels.delete(deviceId);
-      this.peers.delete(deviceId);
+      this.emit('channel_closed', deviceId);
     };
 
     dc.onerror = (err) => {
@@ -150,12 +186,23 @@ class WebRTCManager extends EventEmitter {
   /**
    * Broadcast binary data to all open channels (Used by Host)
    */
-  broadcast(buffer) {
-    for (const [id, dc] of this.dataChannels.entries()) {
+  broadcast(data) {
+    let sentCount = 0;
+    this.dataChannels.forEach((dc, deviceId) => {
       if (dc.readyState === 'open') {
-        dc.send(buffer);
+        try {
+          dc.send(data);
+          sentCount++;
+        } catch (err) {
+          console.warn(`[WebRTC] Failed to send to ${deviceId}:`, err.message);
+        }
       }
+    });
+
+    if (sentCount > 0 && Math.random() < 0.01) {
+      console.log(`[WebRTC] Broadcasted chunk to ${sentCount} nodes via UDP`);
     }
+    return sentCount;
   }
 
   /**
@@ -166,6 +213,29 @@ class WebRTCManager extends EventEmitter {
     if (dc && dc.readyState === 'open') {
       dc.send(buffer);
     }
+  }
+
+  /**
+   * Gracefully close and remove a peer connection
+   */
+  cleanup(deviceId) {
+    console.log(`[WebRTC] Cleaning up connection for ${deviceId}`);
+    
+    // Close data channel
+    const dc = this.dataChannels.get(deviceId);
+    if (dc) {
+      try { dc.close(); } catch (e) {}
+      this.dataChannels.delete(deviceId);
+    }
+
+    // Close peer connection
+    const peer = this.peers.get(deviceId);
+    if (peer) {
+      try { peer.close(); } catch (e) {}
+      this.peers.delete(deviceId);
+    }
+
+    this.pendingCandidates.delete(deviceId);
   }
 }
 

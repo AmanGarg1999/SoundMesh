@@ -1,0 +1,19 @@
+services:
+  soundmesh:
+    build: .
+    image: soundmesh:latest
+    container_name: soundmesh_app
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./certs:/app/certs:ro
+    env_file:
+      - .env
+    environment:
+      - PORT=3000
+    restart: unless-stopped
+    # On Linux, host networking is recommended for low-latency UDP (WebRTC)
+    # network_mode: host 
+    
+    # NOTE: On Mac/Windows, Docker runs in a VM that doesn't support 'network_mode: host'.
+    # Audio will fallback to TCP (WebSocket) automatically, which is fine for most LAN usage.

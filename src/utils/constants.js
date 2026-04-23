@@ -4,8 +4,8 @@
 export const SAMPLE_RATE = 48000;
 export const CHANNELS = 2; // stereo
 export const BITS_PER_SAMPLE = 16;
-export const CHUNK_DURATION_MS = 20; // 20ms per chunk
-export const SAMPLES_PER_CHUNK = (SAMPLE_RATE * CHUNK_DURATION_MS) / 1000; // 960
+export const CHUNK_DURATION_MS = 5; // 5ms per chunk (MTU-safe for raw PCM)
+export const SAMPLES_PER_CHUNK = (SAMPLE_RATE * CHUNK_DURATION_MS) / 1000; // 240
 export const BYTES_PER_SAMPLE = BITS_PER_SAMPLE / 8;
 
 // Audio chunk binary header layout (16 bytes total)
@@ -13,7 +13,7 @@ export const HEADER_SIZE = 16;
 // [0-3]   uint32  sequence number
 // [4-11]  float64 target play time (ms, shared clock domain)
 // [12-13] uint16  channel mask
-// [14-15] uint16  flags (0x01 = keyframe, 0x02 = last chunk)
+// [14-15] uint16  flags (0x01 = keyframe, 0x02 = Opus compressed)
 
 // Sync engine
 export const SYNC_INTERVAL_MS = 500;       // Clock sync beacon interval

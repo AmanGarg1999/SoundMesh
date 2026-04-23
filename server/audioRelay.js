@@ -3,6 +3,7 @@
 // Stores a ring buffer of recent chunks for retransmission on NACK
 
 const RING_BUFFER_SIZE = 100; // Store last 100 chunks for retransmission
+const HEADER_SIZE = 16;      // [seq:4][target:8][mask:2][flags:2]
 
 export class AudioRelay {
   constructor() {
@@ -29,15 +30,9 @@ export class AudioRelay {
     this.chunkMap.set(seq, buffer);
     this.writeIndex++;
 
-    // Clean old entries from map
-    if (this.chunkMap.size > RING_BUFFER_SIZE) {
-      const oldestSeq = seq - RING_BUFFER_SIZE;
-      for (const key of this.chunkMap.keys()) {
-        if (key < oldestSeq) {
-          this.chunkMap.delete(key);
-        }
-      }
-    }
+    // O(1) Map cleanup: removes the single oldest entry
+    const oldestSeq = seq - RING_BUFFER_SIZE;
+    this.chunkMap.delete(oldestSeq);
 
     // Fan out to all connected devices without blocking the Node.js event loop
     const clients = Array.from(wss.clients);
@@ -48,7 +43,8 @@ export class AudioRelay {
       const end = Math.min(i + CHUNK_SIZE, clients.length);
       for (; i < end; i++) {
         const client = clients[i];
-        if (client.readyState === client.OPEN) {
+        // Don't send back to the sender (Host) and only send to open sockets
+        if (client !== senderWs && client.readyState === client.OPEN) {
           client.send(data, { binary: true });
         }
       }
@@ -58,6 +54,10 @@ export class AudioRelay {
     };
 
     processChunk();
+    
+    if (this.stats.chunksRelayed % 100 === 0) {
+      console.log(`[AudioRelay] Relayed chunk #${seq} to ${clients.length - 1} clients`);
+    }
 
     this.stats.chunksRelayed++;
   }

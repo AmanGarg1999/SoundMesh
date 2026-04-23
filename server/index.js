@@ -2,7 +2,8 @@
 import express from 'express';
 import { createServer as createHttpServer } from 'http';
 import { createServer as createHttpsServer } from 'https';
-import { WebSocketServer } from 'ws';
+import * as WS from 'ws';
+const { WebSocketServer } = WS;
 import { networkInterfaces } from 'os';
 import fs from 'fs';
 import path from 'path';
@@ -58,14 +59,6 @@ app.use(session({
   saveUninitialized: true,
   cookie: { secure: isSSL }
 }));
-
-// Serve static files in production
-if (isProduction) {
-  app.use(express.static(path.join(__dirname, '../dist')));
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../dist/index.html'));
-  });
-}
 
 // Serve worklets (needed for AudioWorklet which requires same-origin)
 app.use('/worklets', express.static(path.join(__dirname, '../worklets')));
@@ -247,19 +240,12 @@ wss.on('connection', (ws, req) => {
         }
 
         // Standard message handling (find deviceId from ws)
-        // We find the deviceId associated with this WebSocket
-        let currentDeviceId = null;
-        for (const [id, socket] of deviceRegistry.wsMap.entries()) {
-          if (socket === ws) {
-            currentDeviceId = id;
-            break;
-          }
-        }
-
-        if (currentDeviceId) {
-          handleMessage(ws, currentDeviceId, msg);
-        } else {
+        const currentDeviceId = ws.deviceId;
+  
+        if (!currentDeviceId) {
           console.warn('[SoundMesh] Received message from unregistered socket');
+        } else {
+          handleMessage(ws, currentDeviceId, msg);
         }
       } catch (e) {
         console.error('[SoundMesh] Invalid JSON message:', e.message);
@@ -370,12 +356,18 @@ function handleMessage(ws, deviceId, msg) {
       break;
     }
 
-    // ── WebRTC Signaling relay ──
     case 'webrtc_signal': {
       const { targetDeviceId, signal } = msg.payload;
+      
+      // [Sync v6.2.7] Prevent loopback signaling
+      if (targetDeviceId === deviceId) {
+        return;
+      }
+
       const targetWs = Array.from(wss.clients).find(c => c.deviceId === targetDeviceId);
       
-      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+      if (targetWs && targetWs.readyState === 1) { // 1 is WS.WebSocket.OPEN
+        console.log(`[SoundMesh] Relaying WebRTC signal: ${signal.type} from ${deviceId} to ${targetDeviceId}`);
         targetWs.send(JSON.stringify({
           type: 'webrtc_signal',
           payload: {
@@ -383,6 +375,8 @@ function handleMessage(ws, deviceId, msg) {
             signal
           }
         }));
+      } else {
+        console.warn(`[SoundMesh] Cannot relay signal: Target ${targetDeviceId} not found or not OPEN.`);
       }
       break;
     }
@@ -458,6 +452,15 @@ function handleMessage(ws, deviceId, msg) {
   }
 }
 
+// Serve static files in production (CATCH-ALL)
+// This must be the VERY LAST GET route registered
+if (isProduction) {
+  app.use(express.static(path.join(__dirname, '../dist')));
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../dist/index.html'));
+  });
+}
+
 // ── Helpers ──
 function sendJSON(ws, data) {
   if (ws.readyState === ws.OPEN) {
@@ -475,6 +478,9 @@ function broadcastJSON(data, excludeWs = null) {
 }
 
 function getLocalIP() {
+  // [Docker Sync] If running in Docker, we often need to override with the Host's real IP
+  if (process.env.PUBLIC_IP) return process.env.PUBLIC_IP;
+
   const interfaces = networkInterfaces();
   for (const name of Object.keys(interfaces)) {
     for (const iface of interfaces[name]) {

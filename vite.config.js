@@ -15,10 +15,17 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
-    https: {
-      key: fs.readFileSync(path.resolve(__dirname, 'certs/server.key')),
-      cert: fs.readFileSync(path.resolve(__dirname, 'certs/server.cert')),
-    },
+    https: (() => {
+      const keyPath = path.resolve(__dirname, 'certs/server.key');
+      const certPath = path.resolve(__dirname, 'certs/server.cert');
+      if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+        return {
+          key: fs.readFileSync(keyPath),
+          cert: fs.readFileSync(certPath),
+        };
+      }
+      return false; // Fallback to HTTP for build/dev if certs are missing
+    })(),
     proxy: {
       '/ws': {
         target: 'https://127.0.0.1:3000',
@@ -42,11 +49,6 @@ export default defineConfig({
         },
       },
       '/api': {
-        target: 'https://127.0.0.1:3000',
-        changeOrigin: true,
-        secure: false,
-      },
-      '/worklets': {
         target: 'https://127.0.0.1:3000',
         changeOrigin: true,
         secure: false,
