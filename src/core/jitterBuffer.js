@@ -22,6 +22,7 @@ export class JitterBuffer {
     this.gapCount = 0;
     this.duplicateCount = 0;
     this.lastSeq = -1;
+    this.seenSeqs = new Set(); // [Sync v7.0] Global duplicate detection
     this.totalReceived = 0;
   }
 
@@ -30,6 +31,21 @@ export class JitterBuffer {
    */
   add(chunk, rtt = 0) {
     this.totalReceived++;
+
+    // [Sync v7.0] Hardened Duplicate Detection
+    // Check both current buffer and historical "seen" list
+    if (this.seenSeqs.has(chunk.seq) || this.buffer.some(c => c.seq === chunk.seq)) {
+      this.duplicateCount++;
+      return;
+    }
+
+    // Track sequence in history
+    this.seenSeqs.add(chunk.seq);
+    if (this.seenSeqs.size > 200) {
+      // Keep history window manageable (approx 1s of audio)
+      const first = this.seenSeqs.values().next().value;
+      this.seenSeqs.delete(first);
+    }
 
     // Track arrival time for variance calculation
     this.arrivalTimes.push(performance.now());

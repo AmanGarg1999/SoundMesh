@@ -120,19 +120,20 @@ class PlaybackWorklet extends AudioWorkletProcessor {
         // 2. If we don't have a chunk, try to find the next one
         if (!this.currentChunk && this.buffer.length > 0) {
           const sampleContextTime = currentTime + (i / sampleRate);
-
-          // Find the right chunk
-          while (this.buffer.length > 0) {
-            const nextChunk = this.buffer[0];
+          const next = this.buffer[0];
+          
+          // [Sync v7.0] Precision Pickup: only start if it's actually time to play
+          if (sampleContextTime >= next.playAtContextTime) {
+            this.currentChunk = this.buffer.shift();
             
-            // Allow 50ms jitter window for context time tolerance
-            if (sampleContextTime >= nextChunk.playAtContextTime - 0.050) {
-              this.currentChunk = this.buffer.shift();
+            // If we are slightly late, skip samples to maintain sync
+            const lateSeconds = sampleContextTime - next.playAtContextTime;
+            this.readOffset = Math.floor(lateSeconds * sampleRate);
+            
+            // If we are so late that the whole chunk is gone, drop it
+            if (this.readOffset >= this.currentChunk.data.length / 2) {
+              this.currentChunk = null;
               this.readOffset = 0;
-              break;
-            } else {
-              // Too early
-              break;
             }
           }
         }

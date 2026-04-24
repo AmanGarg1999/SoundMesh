@@ -69,11 +69,11 @@ class AudioPlayer extends EventEmitter {
     this.calibrationOffsetMs = 0; // Manual user nudge (ms)
     this.lastCalibrationTime = 0; // Timestamp of last calibration
     
-    // [Sync v6.0] AudioWorklet state
     this.workletNode = null;
     this.heartbeatOsc = null;
     this.heartbeatGain = null;
     this.initPromise = null; // Initialization singleton guard
+    this.isScheduling = false; // [Sync v7.0] Scheduling Lock
   }
 
   /**
@@ -863,9 +863,11 @@ class AudioPlayer extends EventEmitter {
    * when the previous one ends, creating a continuous audio stream.
    */
   scheduleBuffers() {
-    if (!this.isPlaying || !this.audioContext) return;
+    if (!this.isPlaying || !this.audioContext || this.isScheduling) return;
+    this.isScheduling = true;
 
-    const now = this.audioContext.currentTime;
+    try {
+      const now = this.audioContext.currentTime;
     const sharedTimeNow = clockSync.getSharedTime();
 
     // Android devices have jittery timer callbacks, so we schedule more aggressively
@@ -910,7 +912,7 @@ class AudioPlayer extends EventEmitter {
       const timeUntilPlayMs = chunk.timestamp - sharedTimeNow;
       
       const futureThresholdMs = this.isAndroid ? 300 : 200;
-      const staleThresholdMs = this.isAndroid ? -400 : -250;
+      const staleThresholdMs = this.isAndroid ? -150 : -80; // [Sync v7.0] Tightened to prevent repetitions
 
       // [Sync v6.5] Future-Wait Escape
       // If we are waiting for a 'future' chunk for too long, our clock is likely wrong.
@@ -1117,6 +1119,9 @@ class AudioPlayer extends EventEmitter {
       this.chunksPlayed++;
       this.lastScheduledSeq = chunk.seq;
       scheduled++;
+    }
+    } finally {
+      this.isScheduling = false;
     }
 
     // Emit stats periodically
