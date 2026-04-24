@@ -129,8 +129,8 @@ export function renderHostDashboard() {
                     <span class="stat-label">Devices</span>
                   </div>
                   <div class="stat-item">
-                    <span class="stat-value" id="sync-accuracy">--</span>
-                    <span class="stat-label">Sync (ms)</span>
+                    <span class="stat-value" id="sync-health">HEALTHY</span>
+                    <span class="stat-label">Sync Health</span>
                   </div>
                   <div class="stat-item">
                     <span class="stat-value" id="data-rate">--</span>
@@ -646,11 +646,24 @@ async function fetchConnectionInfo() {
 }
 
 function updateStats() {
-  // Sync accuracy
+  // Sync Health
   const syncStats = clockSync.getStats();
-  const accuracy = document.getElementById('sync-accuracy');
-  if (accuracy && syncStats.avgRtt > 0) {
-    accuracy.textContent = syncStats.offsetVariance.toFixed(1);
+  const healthEl = document.getElementById('sync-health');
+  if (healthEl) {
+    const variance = syncStats.offsetVariance;
+    if (variance < 2) {
+      healthEl.textContent = 'EXCELLENT';
+      healthEl.style.color = 'var(--success)';
+    } else if (variance < 5) {
+      healthEl.textContent = 'HEALTHY';
+      healthEl.style.color = 'var(--accent-primary)';
+    } else if (variance < 15) {
+      healthEl.textContent = 'STRESSED';
+      healthEl.style.color = 'var(--warning)';
+    } else {
+      healthEl.textContent = 'UNSTABLE';
+      healthEl.style.color = 'var(--danger)';
+    }
   }
 
   // Data rate

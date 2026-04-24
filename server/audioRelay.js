@@ -44,7 +44,7 @@ export class AudioRelay {
       for (; i < end; i++) {
         const client = clients[i];
         // Don't send back to the sender (Host) and only send to open sockets
-        if (client !== senderWs && client.readyState === client.OPEN) {
+        if (client !== senderWs && client.readyState === 1) {
           client.send(data, { binary: true });
         }
       }

@@ -6,17 +6,17 @@ import { performance } from 'perf_hooks';
 export class ClockSyncMaster {
   constructor() {
     this.deviceOffsets = new Map(); 
-    this.globalBuffer = 100; // ms
-    this.safetyMargin = 40;  // ms (Dynamic floor)
+    this.globalBuffer = 140; // ms (v6.6 aligned)
+    this.safetyMargin = 60;  // ms (Dynamic floor increased for v6.6 stability)
     this.lastDecayTime = Date.now();
   }
 
   handlePing(deviceId, payload) {
     const serverTime = this.getServerTime();
 
-    // Periodic safety decay: Every 30s of stability, reduce margin by 5ms (Min 20ms)
-    if (Date.now() - this.lastDecayTime > 30000) {
-      this.safetyMargin = Math.max(20, this.safetyMargin - 5);
+    // Periodic safety decay: Every 60s of stability, reduce margin by 5ms (Min 30ms)
+    if (Date.now() - this.lastDecayTime > 60000) {
+      this.safetyMargin = Math.max(30, this.safetyMargin - 5);
       this.lastDecayTime = Date.now();
       console.log(`[ClockSync] Stability detected. Receding safety margin to ${this.safetyMargin}ms`);
     }
@@ -36,7 +36,6 @@ export class ClockSyncMaster {
     // Instant 'puff up' to handle jitter
     this.safetyMargin = Math.min(100, this.safetyMargin + 20);
     this.lastDecayTime = Date.now();
-    console.warn(`[ClockSync] Node reported underrun. Boosting safety margin to ${this.safetyMargin}ms`);
   }
 
   /**

@@ -158,6 +158,7 @@ const deviceRegistry = new DeviceRegistry();
 const sessionManager = new SessionManager(deviceRegistry);
 const clockSync = new ClockSyncMaster();
 const audioRelay = new AudioRelay();
+let lastGlobalBufferBroadcast = 0;
 
 wss.on('connection', (ws, req) => {
   console.log(`[SoundMesh] New connection from ${req.socket.remoteAddress}`);
@@ -347,12 +348,17 @@ function handleMessage(ws, deviceId, msg) {
 
     case 'underrun_report': {
       clockSync.reportUnderrun();
-      // Force immediate global buffer update to all nodes
-      const globalBuffer = clockSync.recalculateGlobalBuffer(deviceRegistry.getAllDevices());
-      broadcastJSON({
-        type: 'global_buffer_update',
-        payload: { globalBuffer },
-      });
+      
+      // [Sync v6.6] Throttle global buffer updates to avoid UI thread congestion
+      const now = Date.now();
+      if (now - lastGlobalBufferBroadcast > 3000) {
+        lastGlobalBufferBroadcast = now;
+        const globalBuffer = clockSync.recalculateGlobalBuffer(deviceRegistry.getAllDevices());
+        broadcastJSON({
+          type: 'global_buffer_update',
+          payload: { globalBuffer },
+        });
+      }
       break;
     }
 
@@ -418,10 +424,25 @@ function handleMessage(ws, deviceId, msg) {
     // ── Switch Host ──
     case 'switch_host': {
       const newHostId = msg.payload.targetDeviceId;
+      console.log(`[SoundMesh] Received switch_host request for ${newHostId} from ${deviceId}`);
+      
       if (deviceRegistry.switchHost(newHostId)) {
-        console.log(`[SoundMesh] Host switched to ${newHostId}`);
+        console.log(`[SoundMesh] Host successfully switched to ${newHostId}`);
+        
+        // Acknowledge to requester
+        sendJSON(ws, { type: 'switch_host_result', payload: { success: true } });
+        
         // Force everyone to reload their UIs with their new roles
-        broadcastJSON({ type: 'force_reload' });
+        // We delay slightly to allow the acknowledgment to reach the requester
+        setTimeout(() => {
+          broadcastJSON({ type: 'force_reload' });
+        }, 1000);
+      } else {
+        console.warn(`[SoundMesh] Failed to switch host to ${newHostId} (Device not found or registry error)`);
+        sendJSON(ws, { 
+          type: 'switch_host_result', 
+          payload: { success: false, error: 'Device not found' } 
+        });
       }
       break;
     }
@@ -463,7 +484,7 @@ if (isProduction) {
 
 // ── Helpers ──
 function sendJSON(ws, data) {
-  if (ws.readyState === ws.OPEN) {
+  if (ws.readyState === 1) { // 1 is OPEN
     ws.send(JSON.stringify(data));
   }
 }
@@ -471,7 +492,7 @@ function sendJSON(ws, data) {
 function broadcastJSON(data, excludeWs = null) {
   const json = JSON.stringify(data);
   wss.clients.forEach((client) => {
-    if (client !== excludeWs && client.readyState === client.OPEN) {
+    if (client !== excludeWs && client.readyState === 1) {
       client.send(json);
     }
   });

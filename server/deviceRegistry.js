@@ -24,8 +24,15 @@ export class DeviceRegistry {
     // we must close the old one to prevent duplicates and phasing issues in audio.
     if (deviceId && this.wsMap.has(deviceId)) {
       const oldWs = this.wsMap.get(deviceId);
-      if (oldWs && oldWs !== ws && oldWs.readyState === 1 /* OPEN */) {
-        // Quietly terminate old socket to avoid UI noise during reconnections
+      if (oldWs && oldWs !== ws && (oldWs.readyState === 1 || oldWs.readyState === 0)) {
+        // [Sync v6.6] CRITICAL: Immediately mark as disconnected so the NEW 
+        // registration (happening RIGHT NOW) doesn't see a conflict.
+        const oldDevice = this.devices.get(deviceId);
+        if (oldDevice) {
+          console.log(`[DeviceRegistry] Invalidating stale session for ${deviceId} before re-registration`);
+          oldDevice.connected = false;
+        }
+        
         oldWs.deviceId = null; 
         oldWs.terminate();
       }
@@ -54,13 +61,25 @@ export class DeviceRegistry {
     }
 
     // MANDATORY GLOBAL CHECK: Ensure only one host exists, even on reconnection.
-    // If this device claims to be host but one is already active, downgrade it.
+    // [Sync v6.6] Robustness: If this device is the PROMOTED host, it MUST take precedence.
     if (role === 'host') {
       const activeHost = this.getHost();
+      const deviceObj = this.devices.get(deviceId);
+      
       if (activeHost && activeHost.deviceId !== deviceId) {
-        console.warn(`[DeviceRegistry] Role Conflict: Device ${deviceId} attempted to join as 'host', but ${activeHost.deviceId} is already active. Downgrading to 'node'.`);
-        role = 'node';
+        // If the current candidate is a specifically PROMOTED host, it wins.
+        if (deviceObj?.isPromotedHost) {
+          console.log(`[DeviceRegistry] Promoted Host ${deviceId} is taking over from ${activeHost.deviceId}`);
+          activeHost.role = 'node'; // Forced downgrade of the old one
+        } else if (activeHost.connected) {
+          // Normal collision: downgrade the newcomer
+          console.warn(`[DeviceRegistry] Role Conflict: Device ${deviceId} attempted to join as 'host', but ${activeHost.deviceId} is already active. Downgrading.`);
+          role = 'node';
+        }
       }
+      
+      // Clear the promotion flag once registered
+      if (deviceObj) delete deviceObj.isPromotedHost;
     }
 
     // Security check: Validate PIN for Nodes
@@ -175,6 +194,7 @@ export class DeviceRegistry {
     }
 
     newHost.role = 'host';
+    newHost.isPromotedHost = true; // [Sync v6.6] Flag to survive the re-registration race
     return true;
   }
 

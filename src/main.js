@@ -198,6 +198,14 @@ function init() {
     setTimeout(() => window.location.reload(), 800);
   });
 
+  wsClient.on('switch_host_result', (payload) => {
+    if (!payload.success) {
+      showToast('Promotion failed: ' + (payload.error || 'Unknown error'), 'error');
+    } else {
+      showToast('Promotion successful! Reloading...', 'success');
+    }
+  });
+
   // Handle connection state
   wsClient.on('disconnected', () => {
     showToast('Connection lost. Reconnecting...', 'warning');

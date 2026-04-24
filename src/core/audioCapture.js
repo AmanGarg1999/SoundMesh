@@ -6,6 +6,7 @@ import { EventEmitter, float32ToInt16 } from '../utils/helpers.js';
 import { SAMPLE_RATE, CHANNELS, SAMPLES_PER_CHUNK, CHUNK_DURATION_MS } from '../utils/constants.js';
 import { clockSync } from './clockSync.js';
 import { insomnia } from '../utils/insomnia.js';
+import { audioPlayer } from './audioPlayer.js';
 
 class AudioCapture extends EventEmitter {
   constructor() {
@@ -172,17 +173,13 @@ class AudioCapture extends EventEmitter {
       // Connect file source → processing pipeline
       this.setupProcessingPipeline(this.fileSourceNode);
 
-      // Also connect to destination so host can hear it, but delay it to match the network mesh perfectly!
-      // This eliminates the 100ms echo between the Host laptop and Node phones in the same room.
-      const delayInSeconds = clockSync.getGlobalBuffer() / 1000;
-      const delayNode = this.audioContext.createDelay(delayInSeconds + 0.1);
-      delayNode.delayTime.value = delayInSeconds;
-      
-      this.fileSourceNode.connect(delayNode);
-      delayNode.connect(this.audioContext.destination);
-
       this.fileSourceNode.start();
       this.isFilePlaying = true;
+      
+      // [Sync v6.6] Host Playback: Automatically start the synced player for files
+      if (!audioPlayer.isPlaying) {
+        audioPlayer.start().catch(e => console.warn('Failed to auto-start player:', e));
+      }
       this.isCapturing = true;
       this.source = 'file';
       this.sequenceNumber = 0;

@@ -59,7 +59,10 @@ export function renderNodeView() {
               </div>
             </div>
             <div id="host-name-display" style="margin-bottom: 16px; font-weight: 500; font-size: 1.1em; color: var(--text-secondary);">Searching for Host...</div>
-            <button class="btn btn-primary w-full pulsate" id="btn-connect-host" style="font-size: 1.1em; padding: 12px;">🔌 Connect to Host</button>
+            <div class="flex gap-sm">
+              <button class="btn btn-primary pulsate" id="btn-connect-host" style="flex: 2; font-size: 1.1em; padding: 12px;">🔌 Connect to Host</button>
+              <button class="btn btn-secondary" id="btn-force-resync" style="flex: 1;" title="Force Clock Resync">🔄 Resync</button>
+            </div>
           </div>
 
           <!-- Waveform -->
@@ -531,6 +534,14 @@ function bindNodeEvents() {
     }
   });
 
+  document.getElementById('btn-force-resync')?.addEventListener('click', () => {
+    audioPlayer.stop();
+    setTimeout(() => {
+      audioPlayer.start();
+      showToast('Clock Resynced!', 'success');
+    }, 100);
+  });
+
   // Volume
   document.getElementById('node-volume')?.addEventListener('input', (e) => {
     const vol = parseInt(e.target.value) / 100;
@@ -561,12 +572,54 @@ function bindNodeEvents() {
     }
   });
 
-  // Become Host
-  document.getElementById('btn-become-host')?.addEventListener('click', () => {
-    if (confirm('Are you sure you want to make this device the Host? The current host will become a standard Node.')) {
-      wsClient.send('switch_host', { targetDeviceId: appState.deviceId });
-    }
-  });
+  // Become Host (Refined for responsiveness)
+  const btnBecomeHost = document.getElementById('btn-become-host');
+  if (btnBecomeHost) {
+    let confirmTimeout = null;
+
+    btnBecomeHost.addEventListener('pointerdown', async (e) => {
+      // Prevent double-clicks or accidental fires
+      if (btnBecomeHost.disabled) return;
+
+      if (!btnBecomeHost.dataset.confirmed) {
+        // First click: Request confirmation
+        btnBecomeHost.dataset.confirmed = "true";
+        btnBecomeHost.innerHTML = "⚠️ Confirm Promotion?";
+        btnBecomeHost.className = "btn btn-warning w-full pulse-warning";
+        
+        // Reset if not confirmed within 3 seconds
+        if (confirmTimeout) clearTimeout(confirmTimeout);
+        confirmTimeout = setTimeout(() => {
+          btnBecomeHost.dataset.confirmed = "";
+          btnBecomeHost.innerHTML = "👑 Promote device to Host";
+          btnBecomeHost.className = "btn btn-outline w-full";
+        }, 3000);
+        return;
+      }
+
+      // Second click: Execute
+      if (confirmTimeout) clearTimeout(confirmTimeout);
+      btnBecomeHost.disabled = true;
+      btnBecomeHost.innerHTML = '<span class="loading-spinner"></span> Promoting...';
+      showToast('Requesting host promotion...', 'info');
+      
+      try {
+        const success = wsClient.send('switch_host', { targetDeviceId: appState.deviceId });
+        
+        if (!success) {
+          showToast('Failed to send request. Check your connection.', 'error');
+          // Reset button
+          btnBecomeHost.disabled = false;
+          btnBecomeHost.dataset.confirmed = "";
+          btnBecomeHost.innerHTML = "👑 Promote device to Host";
+          btnBecomeHost.className = "btn btn-outline w-full";
+        }
+      } catch (err) {
+        showToast('Promotion failed: ' + err.message, 'error');
+        btnBecomeHost.disabled = false;
+      }
+    });
+  }
 
   // Calibration Slider
   const calSlider = document.getElementById('node-calibration');

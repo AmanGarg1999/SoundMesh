@@ -55,11 +55,18 @@ class WSClient extends EventEmitter {
       });
     };
 
-    this.ws.onmessage = (event) => {
-      if (event.data instanceof ArrayBuffer) {
-        // Binary audio data
-        if (Math.random() < 0.05) console.log(`[WSClient] Received binary data: ${event.data.byteLength} bytes`);
-        this.emit('audio_data', event.data);
+    this.ws.onmessage = async (event) => {
+      if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+        // [Sync v6.2.4] Handle both ArrayBuffer and Blob for cross-browser stability
+        let data = event.data;
+        if (data instanceof Blob) {
+          data = await data.arrayBuffer();
+        }
+        
+        if (Math.random() < 0.01) {
+          console.log(`[WSClient] Received binary data: ${data.byteLength} bytes`);
+        }
+        this.emit('audio_data', data);
       } else {
         // JSON control message
         try {
@@ -115,16 +122,33 @@ class WSClient extends EventEmitter {
    * Send a JSON control message
    */
   send(type, payload = {}) {
-    if (!this.connected) return;
-    this.ws.send(JSON.stringify({ type, payload }));
+    if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      console.warn(`[WSClient] Cannot send ${type}: WebSocket not connected (State: ${this.ws?.readyState})`);
+      return false;
+    }
+
+    try {
+      this.ws.send(JSON.stringify({ type, payload }));
+      return true;
+    } catch (e) {
+      console.error(`[WSClient] Failed to send ${type}:`, e);
+      return false;
+    }
   }
 
   /**
    * Send binary audio data
    */
   sendBinary(buffer) {
-    if (!this.connected) return;
-    this.ws.send(buffer);
+    if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    
+    try {
+      this.ws.send(buffer);
+      return true;
+    } catch (e) {
+      // Don't spam binary errors as they can happen frequently during jitter
+      return false;
+    }
   }
 
   /**

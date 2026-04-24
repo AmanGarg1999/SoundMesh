@@ -10,6 +10,7 @@ import { JitterBuffer } from './jitterBuffer.js';
 import {
   SAMPLE_RATE,
   CHANNELS,
+  CHUNK_DURATION_MS,
   SAMPLES_PER_CHUNK,
   HEADER_SIZE,
   PI_KP,
@@ -59,6 +60,8 @@ class AudioPlayer extends EventEmitter {
     // Stats
     this.syncDrift = 0;
     this.activeSources = new Set();
+    this.ingestionQueue = []; // Queue chunks received during startup phase
+    this.lastUnderrunReportTime = 0; // [Sync v6.5.2] Throttling to prevent UI lag
 
     // Surround Sound state
     this.surroundMask = 'all'; // 'left', 'right', 'all', 'center', 'lfe'
@@ -104,16 +107,14 @@ class AudioPlayer extends EventEmitter {
 
       // [Sync v6.0] Listen for audio data
       this.webrtcListener = (data) => {
-        if (this.isPlaying) this.receiveChunk(data);
+        this.receiveChunk(data);
       };
       this.wsListener = (data) => {
         // [Sync v6.2.1] Robust Fallback Logic: Always process WebSocket audio.
         // The JitterBuffer handles duplicate detection (sequence number checks),
         // so we can safely accept both UDP and TCP packets. This ensures audio
         // continues even if WebRTC is "Open" but firewalled.
-        if (this.isPlaying) {
-          this.receiveChunk(data);
-        }
+        this.receiveChunk(data);
       };
 
       webrtcManager.on('audio_data', this.webrtcListener);
@@ -517,6 +518,11 @@ class AudioPlayer extends EventEmitter {
     this.spatialDelayMs = (distMeters / 343) * 1000;
     
     console.log(`[AudioPlayer] Surround updated: ${label}. Mask: ${this.surroundMask}, Delay: +${this.spatialDelayMs.toFixed(1)}ms`);
+    
+    // [Sync v6.6] Update Worklet Mask
+    if (this.workletNode) {
+      this.workletNode.port.postMessage({ type: 'set_mask', payload: this.surroundMask });
+    }
   }
   
   /**
@@ -533,6 +539,7 @@ class AudioPlayer extends EventEmitter {
    * Start playback — begin scheduling buffers from the jitter buffer
    */
   async start() {
+    console.log('[AudioPlayer] start() initiated');
     // Idempotent: safe to call multiple times
     if (this.isPlaying) {
       console.log('[AudioPlayer] Already playing (idempotent)');
@@ -560,9 +567,34 @@ class AudioPlayer extends EventEmitter {
       this.workletNode.port.postMessage({ type: 'start' });
     }
 
-    // Start scheduler via Web Worker (Bypasses background throttling)
+    // [Sync v6.5] Drain Ingestion Queue
+    // Chunks received during the init() phase are now processed into the jitter buffer
+    if (this.ingestionQueue && this.ingestionQueue.length > 0) {
+      console.log(`[AudioPlayer] Draining ingestion queue (${this.ingestionQueue.length} chunks)...`);
+      const chunks = [...this.ingestionQueue];
+      this.ingestionQueue = []; // Clear immediately
+      for (const data of chunks) {
+        this.receiveChunk(data);
+      }
+    }
+
+    // [Sync v6.3] High-Compatibility Scheduler Worker
+    // We use a Blob to ensure the worker loads even if relative paths are restricted
     if (!this.schedulerWorker) {
-      this.schedulerWorker = new Worker(new URL('./scheduler.worker.js', import.meta.url), { type: 'module' });
+      const workerCode = `
+        let timer = null;
+        self.onmessage = (e) => {
+          if (e.data.action === 'start') {
+            if (timer) clearInterval(timer);
+            timer = setInterval(() => self.postMessage('tick'), e.data.interval);
+          } else if (e.data.action === 'stop') {
+            clearInterval(timer);
+            timer = null;
+          }
+        };
+      `;
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      this.schedulerWorker = new Worker(URL.createObjectURL(blob));
       this.schedulerWorker.onmessage = () => {
         if (this.isPlaying) {
           this.scheduleBuffers();
@@ -572,18 +604,31 @@ class AudioPlayer extends EventEmitter {
     }
     this.schedulerWorker.postMessage({ action: 'start', interval: 20 });
   
-    // Initialize silent background audio trick
-    this.initBackgroundAudio();
-    this.setupMediaSession();
+    // [Sync v6.8] High-Precision Frontend Scheduler (rAF)
+    // Replaces main-thread setInterval with RequestAnimationFrame for display-locked timing.
+    // This provides much smoother scheduling when the tab is focused.
+    const runScheduler = () => {
+      if (!this.isPlaying) return;
+      this.scheduleBuffers();
+      this.updateWorkletClock();
+      requestAnimationFrame(runScheduler);
+    };
+    requestAnimationFrame(runScheduler);
 
-    // [Sync v3.0] Activate all enabled output sinks
-    await this.updateSinks();
-
-    // [Insomnia] Activate high-priority sleep prevention
-    await insomnia.activate();
-
-    // Start health watchdog (handles mobile suspension)
+    // Start health watchdog
     this.startWatchdog();
+
+    // Background tasks (Non-blocking)
+    (async () => {
+      try {
+        await this.updateSinks();
+        await insomnia.activate();
+        this.initBackgroundAudio();
+        this.setupMediaSession();
+      } catch (e) {
+        console.warn('[AudioPlayer] Background module init failed:', e);
+      }
+    })();
 
     console.log('[AudioPlayer] Started');
     this.emit('playback_started');
@@ -651,13 +696,19 @@ class AudioPlayer extends EventEmitter {
    * Receive a binary audio packet from the WebSocket
    */
   receiveChunk(arrayBuffer) {
-    console.log(`[AudioPlayer] receiveChunk() called. isPlaying: ${this.isPlaying}, size: ${arrayBuffer.byteLength}`);
-    
+    if (!(arrayBuffer instanceof ArrayBuffer)) {
+      // [Sync v6.5.1] Binary Safety: Reject strings/objects that might arrive via misconfigured middleware
+      console.warn('[AudioPlayer] Received non-ArrayBuffer data in receiveChunk');
+      return;
+    }
+
     if (!this.isPlaying) {
-      if (!this.dropLogCount) this.dropLogCount = 0;
-      this.dropLogCount++;
-      if (this.dropLogCount <= 5) {
-        console.warn(`[AudioPlayer] Dropped chunk (not playing). Count: ${this.dropLogCount}`);
+      // [Sync v6.2.2] Buffer chunks during the short window of 'start()' initialization
+      if (this.ingestionQueue && this.ingestionQueue.length < 200) {
+        if (this.ingestionQueue.length % 50 === 0) {
+          console.log(`[AudioPlayer] Buffering to ingestion queue (size: ${this.ingestionQueue.length + 1})`);
+        }
+        this.ingestionQueue.push(arrayBuffer);
       }
       return;
     }
@@ -667,8 +718,10 @@ class AudioPlayer extends EventEmitter {
       const view = new DataView(arrayBuffer);
       const seq = view.getUint32(0, true);
       
-      if (seq % 100 === 0) {
-        console.log(`[AudioPlayer] RECEIVED Chunk #${seq} | Size: ${arrayBuffer.byteLength} bytes | Buff: ${this.jitterBuffer.size()}`);
+      if (seq % 50 === 0) {
+        // [Sync v6.6] Diagnostic: If we receive a chunk while not connected, it's a loopback
+        const isLoopback = !wsClient.connected; 
+        console.log(`[AudioPlayer] RECEIVED Chunk #${seq} ${isLoopback ? '(Loopback)' : ''} | Size: ${arrayBuffer.byteLength} bytes | Buff: ${this.jitterBuffer.size()}`);
       }
       
       const targetPlayTime = view.getFloat64(4, true);
@@ -717,10 +770,10 @@ class AudioPlayer extends EventEmitter {
 
         this.jitterBuffer.add({
           seq,
-          targetPlayTime,
+          timestamp: targetPlayTime,
           channelMask,
           pcmData: pcmFloat32,
-        });
+        }, clockSync.stats.avgRtt);
       }
     } catch (err) {
       console.error('[AudioPlayer] Failed to process incoming chunk:', err);
@@ -747,7 +800,15 @@ class AudioPlayer extends EventEmitter {
     this.seqMap.delete(timestamp);
 
     const numberOfFrames = audioData.numberOfFrames;
-    const pcmData = new Float32Array(numberOfFrames * 2);
+    
+    // [Sync v6.7] Validate Opus frame count
+    // Opus decoder may output 120, 240, or 960 frames depending on bitrate/packet
+    // We ONLY accept SAMPLES_PER_CHUNK (240) to maintain sync
+    if (numberOfFrames !== SAMPLES_PER_CHUNK) {
+      console.warn(`[AudioPlayer] Opus frame count mismatch: got ${numberOfFrames}, expected ${SAMPLES_PER_CHUNK}. Trimming/padding.`);
+    }
+
+    const pcmData = new Float32Array(SAMPLES_PER_CHUNK * 2); // Always allocate expected size
     
     try {
       if (audioData.format === 'f32-planar') {
@@ -758,13 +819,23 @@ class AudioPlayer extends EventEmitter {
         audioData.copyTo(leftPlane, { planeIndex: 0 });
         audioData.copyTo(rightPlane, { planeIndex: 1 });
 
-        for (let i = 0; i < numberOfFrames; i++) {
+        // Copy with trim/pad to SAMPLES_PER_CHUNK
+        const copyCount = Math.min(numberOfFrames, SAMPLES_PER_CHUNK);
+        for (let i = 0; i < copyCount; i++) {
           pcmData[i * 2] = leftPlane[i];
           pcmData[i * 2 + 1] = rightPlane[i];
         }
+        // Pad with zeros if necessary
+        for (let i = copyCount; i < SAMPLES_PER_CHUNK; i++) {
+          pcmData[i * 2] = 0;
+          pcmData[i * 2 + 1] = 0;
+        }
       } else if (audioData.format === 'f32') {
         // Already Interleaved: [LRLRLR...]
-        audioData.copyTo(pcmData, { planeIndex: 0 });
+        const maxCopy = Math.min(numberOfFrames * 2, SAMPLES_PER_CHUNK * 2);
+        const tempBuffer = new Float32Array(numberOfFrames * 2);
+        audioData.copyTo(tempBuffer, { planeIndex: 0 });
+        pcmData.set(tempBuffer.subarray(0, maxCopy));
       } else {
         console.warn(`[AudioPlayer] Unsupported decoder format: ${audioData.format}. Attempting planar fallback.`);
         // Default to planar-style copy attempt
@@ -775,10 +846,10 @@ class AudioPlayer extends EventEmitter {
 
       this.jitterBuffer.add({
         seq,
-        targetPlayTime,
+        timestamp: targetPlayTime,
         channelMask: 0x0003,
         pcmData,
-      });
+      }, clockSync.stats.avgRtt);
     } catch (err) {
       console.error('[AudioPlayer] Failed to extract audio from AudioData:', err);
     } finally {
@@ -798,29 +869,58 @@ class AudioPlayer extends EventEmitter {
     const sharedTimeNow = clockSync.getSharedTime();
 
     // Android devices have jittery timer callbacks, so we schedule more aggressively
-    // and tolerate older chunks instead of dropping them
-    const maxSchedule = this.isAndroid ? 12 : 8;
+    // and tolerate older chunks instead of dropping them [Sync v6.7]
+    // INCREASED: Doubled scheduling depth to prevent starvation underruns
+    const maxSchedule = this.isAndroid ? 20 : 16;  // ← UP from 12/8 (80ms buffer headroom)
     const futureThresholdMs = this.isAndroid ? 300 : 200;
     const staleThresholdMs = this.isAndroid ? -400 : -250;
 
     let scheduled = 0;
+    const bufferSize = this.jitterBuffer.size();
+
+    // Diagnostic logging for empty buffer
+    if (bufferSize === 0 && this.isPlaying && this.chunksPlayed > 0 && Math.random() < 0.05) {
+      console.warn(`[AudioPlayer] JitterBuffer is EMPTY. chunksPlayed: ${this.chunksPlayed}`);
+    }
 
     while (scheduled < maxSchedule) {
+      // [Sync v6.2.9] Buffer Overflow Recovery
+      // If the buffer is getting too deep, we are likely stalled. Flush half.
+      if (this.jitterBuffer.size() > 60) {
+        console.warn(`[AudioPlayer] Buffer overflow (${this.jitterBuffer.size()}). Flushing...`);
+        for (let i = 0; i < 30; i++) this.jitterBuffer.pop();
+      }
+
       const chunk = this.jitterBuffer.peek();
       if (!chunk) {
-        // [Sync v5.6] Underrun Watchdog
+        // [Sync v5.6] Underrun Watchdog (Throttled)
         // If we are actively playing but the buffer is empty, tell the server 
-        // to puff up the global buffer to prevent future stutters
+        // to puff up the global buffer to prevent future stutters.
+        // Throttled to 2 seconds to prevent UI/Network congestion.
         if (this.isPlaying && this.chunksPlayed > 10) {
-          wsClient.send('underrun_report');
+          const nowMs = performance.now();
+          if (nowMs - this.lastUnderrunReportTime > 2000) {
+            this.lastUnderrunReportTime = nowMs;
+            wsClient.send('underrun_report');
+          }
         }
         break;
       }
 
       const timeUntilPlayMs = chunk.timestamp - sharedTimeNow;
       
-      if (scheduled === 0 && this.chunksPlayed % 50 === 0) {
-        console.log(`[AudioPlayer] Next chunk #${chunk.seq} | timeUntilPlay: ${timeUntilPlayMs.toFixed(1)}ms | Thresholds: [${staleThresholdMs}, ${futureThresholdMs}] | Context: ${this.audioContext.state}`);
+      const futureThresholdMs = this.isAndroid ? 300 : 200;
+      const staleThresholdMs = this.isAndroid ? -400 : -250;
+
+      // [Sync v6.5] Future-Wait Escape
+      // If we are waiting for a 'future' chunk for too long, our clock is likely wrong.
+      // We force a re-anchor to the current chunk to break the silence.
+      if (timeUntilPlayMs > 1000 && this.chunksPlayed === 0) {
+        console.warn(`[AudioPlayer] Clock divergence detected (${timeUntilPlayMs.toFixed(0)}ms). Snapping to current chunk.`);
+        this.isFirstChunk = true;
+        this.nextScheduledTime = 0;
+        this.calibrationOffsetMs -= (timeUntilPlayMs - 50);
+        break; // Re-run loop with new offset
       }
 
       if (timeUntilPlayMs > futureThresholdMs) {
@@ -842,36 +942,39 @@ class AudioPlayer extends EventEmitter {
         ((timeUntilPlayMs - this.spatialDelayMs + this.calibrationOffsetMs) / 1000) - 
         this.outputLatency;
 
-      // [Sync v4.2] Sample-Discrete Quantization
-      // We align the hardware target to the nearest 1/48000s boundary.
-      // This eliminates the 'floating phase' that causes the hollow phasing sound.
-      const sampleStep = 1 / SAMPLE_RATE;
-      absolutePlayAt = Math.round(absolutePlayAt / sampleStep) * sampleStep;
+      // [Sync v6.7] REMOVED Sample-Discrete Quantization
+      // The rounding was creating micro-gaps between chunks (high-freq fizz)
+      // Direct calculation is more stable than discretization.
+      // Just use the calculated time directly
+      // const sampleStep = 1 / SAMPLE_RATE;
+      // absolutePlayAt = Math.round(absolutePlayAt / sampleStep) * sampleStep;
 
       if (this.isFirstChunk) {
-        // [Sync v5.4] First Chunk Guard
-        // If the first chunk is late, we calibrate, but we CLAMP the adjustment 
-        // to 500ms to prevent runaway inflation during initial clock convergence.
-        if (absolutePlayAt < now + 0.05) {
-          let neededMs = ((now + 0.06) - absolutePlayAt) * 1000;
-          neededMs = Math.min(500, neededMs); // Safety Ceiling
+        // [Sync v6.9] Increased Resilience First Chunk Handling
+        // We target a slightly larger startup delay (60ms) to provide more jitter headroom.
+        const targetStartupDelay = 0.06; 
+        if (absolutePlayAt < now + targetStartupDelay) {
+          let neededMs = ((now + targetStartupDelay + 0.01) - absolutePlayAt) * 1000;
+          neededMs = Math.min(400, neededMs); // Increased ceiling for recovery
           
           this.calibrationOffsetMs += neededMs;
-          absolutePlayAt = now + 0.06;
-          console.log(`[AudioPlayer] First chunk late. Clamped adjustment: ${neededMs.toFixed(1)}ms. Total offset: ${this.calibrationOffsetMs.toFixed(1)}ms`);
+          absolutePlayAt = now + targetStartupDelay + 0.01;
+          console.log(`[AudioPlayer] First chunk resilient start. Adjustment: ${neededMs.toFixed(1)}ms. Offset: ${this.calibrationOffsetMs.toFixed(1)}ms`);
         }
 
-        // [Sync v5.5] Global Phase-Lock
-        // We anchor the session start to a synchronized 100ms grid on the MASTER CLOCK.
-        // This ensures every device starts its first sample on the same phase boundary.
+        // [Sync v6.9] Stable Global Phase-Lock
+        // We anchor the session to a 100ms grid (back from 50ms) for better long-term stability.
         const sharedAnchorTime = Math.ceil(sharedTimeNow / 100) * 100;
-        const localAnchorTime = clockSync.toLocalTime(sharedAnchorTime);
-        const quantizedAnchor = Math.round(localAnchorTime / sampleStep) * sampleStep;
+        const deltaMs = sharedAnchorTime - sharedTimeNow;
         
-        // Ensure anchor is in the future
-        this.nextScheduledTime = Math.max(quantizedAnchor, now + 0.05);
+        // Ensure anchor is at least 60ms in the future to allow for buffer loading
+        this.nextScheduledTime = now + (deltaMs / 1000);
+        if (this.nextScheduledTime < now + 0.06) {
+          this.nextScheduledTime += 0.1; // Push to next 100ms boundary
+        }
+        
         this.isFirstChunk = false;
-        console.log(`[AudioPlayer] Phase-Locked session to ${sharedAnchorTime % 1000}ms grid. Anchor offset: ${(this.nextScheduledTime - now).toFixed(3)}s`);
+        console.log(`[AudioPlayer] Phase-Locked session to ${sharedAnchorTime % 1000}ms grid (Tight). Anchor: ${(this.nextScheduledTime - now).toFixed(3)}s`);
       }
 
       // absolutePlayAt is when this buffer SHOULD play perfectly in sync.
@@ -944,71 +1047,72 @@ class AudioPlayer extends EventEmitter {
         SAMPLE_RATE
       );
 
-      // De-interleave and apply Surround Masking
-      const leftChannel = audioBuffer.getChannelData(0);
-      const rightChannel = audioBuffer.getChannelData(1);
-      for (let i = 0; i < SAMPLES_PER_CHUNK; i++) {
-        // [Sync v6.2.8] Normalize Int16 to Float32 (-1.0 to 1.0)
-        // This is critical. WebAudio outputs will clip or stay silent if fed raw Int16.
-        let l = (chunk.pcmData[i * 2] || 0) / 32768;
-        let r = (chunk.pcmData[i * 2 + 1] || 0) / 32768;
+      // [Sync v6.6] Optimization: Skip redundant processing if using Worklet
+      if (!this.workletNode || this.workletFallbackActive) {
+        // De-interleave and apply Surround Masking (Only for BufferSource path)
+        const leftChannel = audioBuffer.getChannelData(0);
+        const rightChannel = audioBuffer.getChannelData(1);
+        for (let i = 0; i < SAMPLES_PER_CHUNK; i++) {
+          let l = chunk.pcmData[i * 2] || 0;
+          let r = chunk.pcmData[i * 2 + 1] || 0;
 
-        if (this.surroundMask === 'left') r = 0;
-        else if (this.surroundMask === 'right') l = 0;
-        else if (this.surroundMask === 'center') {
-          const mix = (l + r) * 0.707;
-          l = mix; r = mix;
-        } else if (this.surroundMask === 'lfe') {
-          const mix = (l + r) * 0.707;
-          l = mix; r = mix;
+          if (this.surroundMask === 'left') r = 0;
+          else if (this.surroundMask === 'right') l = 0;
+          else if (this.surroundMask === 'center' || this.surroundMask === 'lfe') {
+            const mix = (l + r) * 0.707;
+            l = mix; r = mix;
+          }
+
+          leftChannel[i] = l;
+          rightChannel[i] = r;
         }
-
-        leftChannel[i] = l;
-        rightChannel[i] = r;
       }
 
-      // [Sync v6.2.9] Prepare Float32 view for Worklet transfer
-      const floatData = new Float32Array(leftChannel.length + rightChannel.length);
-      for (let i = 0; i < leftChannel.length; i++) {
-        floatData[i * 2] = leftChannel[i];
-        floatData[i * 2 + 1] = rightChannel[i];
-      }
-
-      // Schedule gapless playback
-      const source = this.audioContext.createBufferSource();
-      source.buffer = audioBuffer;
-      source.playbackRate.value = rate;
-      source.connect(this.analyserNode);
-
-      // Track for instant termination
-      this.activeSources.add(source);
-      
-      // Memory leak cleanup: unmount after playback
-      source.onended = () => {
-        this.activeSources.delete(source);
-        source.disconnect();
-      };
-
+      // Schedule gapless playback [Sync v6.7]
       const actualPlayAt = Math.max(this.nextScheduledTime, now);
 
-      // [Sync v6.0] Transfer to High-Priority AudioWorklet
+      // [Sync v6.7] STRICTLY Single-Path Scheduling
+      // PRIMARY: AudioWorklet (Lower latency, sample-accurate)
+      // FALLBACK: BufferSource (Only if worklet unavailable)
+      // Never create/schedule BOTH to prevent overlapping crackles
+      
       if (this.workletNode && !this.workletFallbackActive) {
+        // WORKLET PATH: Pass Float32 data directly, no de-interleaving
         this.workletNode.port.postMessage({
           type: 'push_chunk', 
           payload: {
-            data: floatData,
-            targetPlayTime: clockSync.toSharedTime(actualPlayAt * 1000)
+            data: chunk.pcmData,
+            playAtContextTime: actualPlayAt
           }
         });
+
+        if (this.chunksPlayed % 200 === 0) {
+          console.log(`[AudioPlayer] Scheduled chunk #${chunk.seq} via AudioWorklet at t=${actualPlayAt.toFixed(3)}s`);
+        }
       } else {
-        // Fallback to legacy scheduling
+        // FALLBACK PATH: Only use BufferSource if worklet not available
+        const source = this.audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.playbackRate.value = rate;
+        source.connect(this.analyserNode);
+
+        this.activeSources.add(source);
+        source.onended = () => {
+          this.activeSources.delete(source);
+          source.disconnect();
+        };
+
         source.start(actualPlayAt);
+        if (this.chunksPlayed % 100 === 0) {
+          console.log(`[AudioPlayer] Scheduled chunk #${chunk.seq} via BufferSource Fallback at t=${actualPlayAt.toFixed(3)}s`);
+        }
       }
 
-      // [Sync v5.2] Advance schedule with sample-discrete precision
+      // [Sync v5.2] Advance schedule - NO quantization [Sync v6.7]
+      // Direct calculation without rounding prevents gap artifacts
       const chunkDuration = SAMPLES_PER_CHUNK / SAMPLE_RATE;
       const nextTime = actualPlayAt + (chunkDuration / rate);
-      this.nextScheduledTime = Math.round(nextTime / sampleStep) * sampleStep;
+      this.nextScheduledTime = nextTime;  // ← Direct, no quantization
 
       this.chunksPlayed++;
       this.lastScheduledSeq = chunk.seq;
@@ -1180,12 +1284,18 @@ class AudioPlayer extends EventEmitter {
   updateWorkletClock() {
     if (!this.workletNode) return;
 
+    // [Sync v6.4] Hardened Clock Sync: Ensure all values are defined
+    // If clockSync isn't fully initialized, provide sensible defaults
+    const offset = clockSync.offset ?? 0;
+    const skew = clockSync.skew ?? 0;
+    const lastSyncTime = clockSync.lastSyncTime ?? performance.now();
+
     this.workletNode.port.postMessage({
       type: 'sync_update',
       payload: {
-        offset: clockSync.offset,
-        skew: clockSync.skew,
-        lastSyncTime: clockSync.lastSyncTime,
+        offset,
+        skew,
+        lastSyncTime,
         timeOrigin: performance.timeOrigin,
         performanceNow: performance.now(),
         audioContextTime: this.audioContext.currentTime * 1000

@@ -22,17 +22,17 @@ export const SYNC_WINDOW_SIZE = 32;        // Rolling average window (doubled fo
 export const SKEW_WINDOW_SIZE = 64;        // Window for linear regression of clock skew
 export const SYNC_OK_THRESHOLD = 1.5;      // ms — in sync (tightened for phase alignment)
 export const SYNC_DRIFT_THRESHOLD = 10;    // ms — drifting
-export const DEFAULT_GLOBAL_BUFFER = 80;   // ms (reduced for ultra-low latency)
+export const DEFAULT_GLOBAL_BUFFER = 100;  // ms (Reduced from 140 - better clock sync)
 
-// PI Controller for phase locking
-export const PI_KP = 0.02;                 // Smooth proportional gain (lowered to suppress jitter)
-export const PI_KI = 0.0005;               // Smooth integral gain (lowered to prevent hunting)
-export const PI_INTEGRAL_MAX = 0.02;       // Anti-windup cap
+// PI Controller for phase locking [Sync v6.9 - Ultra-Smooth]
+export const PI_KP = 0.002;                // REDUCED from 0.005 → 2.5x smoother (eliminates pitch warble)
+export const PI_KI = 0.00005;              // REDUCED from 0.0001 → 2x less aggressive
+export const PI_INTEGRAL_MAX = 0.002;      // REDUCED from 0.005 → 2.5x lower ceiling
 
 // Jitter buffer
 export const JITTER_MIN_MS = 20;
-export const JITTER_MAX_MS = 200;
-export const JITTER_INITIAL_MS = 60;
+export const JITTER_MAX_MS = 300;
+export const JITTER_INITIAL_MS = 100;
 export const JITTER_EXPAND_THRESHOLD = 10; // ms variance to trigger expansion
 export const PLAYBACK_RATE_ADJUST = 0.005; // ±0.5% rate adjustment (strictly enforced for audio quality)
 

@@ -21,6 +21,10 @@ class PlaybackWorklet extends AudioWorkletProcessor {
     this.lastHeartbeat = 0;
     this.bufferSize = 240; // Default
 
+    this.chunksReceived = 0;
+    this.lastStarveLog = 0;
+    this.surroundMask = 'all';
+
     this.port.onmessage = (e) => {
       const { type, payload } = e.data;
       if (type === 'config') {
@@ -28,8 +32,19 @@ class PlaybackWorklet extends AudioWorkletProcessor {
         console.log(`[PlaybackWorklet] Configured with bufferSize: ${this.bufferSize}`);
       } else if (type === 'push_chunk') {
         this.buffer.push(payload);
+        this.chunksReceived++;
+
+        if (this.chunksReceived === 1) {
+          console.log(`[PlaybackWorklet] Received first chunk for playback (id: ${Math.random().toString(36).slice(2, 8)})`);
+        } else if (this.chunksReceived % 100 === 0) {
+          console.log(`[PlaybackWorklet] Status: Received ${this.chunksReceived} chunks, Buffer depth: ${this.buffer.length}`);
+        }
+
         // Keep queue size stable (approx 1 second of buffer max)
-        if (this.buffer.length > 50) this.buffer.shift();
+        if (this.buffer.length > 50) {
+          console.warn(`[PlaybackWorklet] Buffer overflow (${this.buffer.length}). Dropping oldest chunk.`);
+          this.buffer.shift();
+        }
       } else if (type === 'sync_update') {
         this.globalOffset = payload.offset;
         this.globalSkew = payload.skew;
@@ -42,13 +57,18 @@ class PlaybackWorklet extends AudioWorkletProcessor {
         this.audioContextTime = payload.audioContextTime;
       } else if (type === 'set_rate') {
         this.playbackRate = payload;
+      } else if (type === 'set_mask') {
+        this.surroundMask = payload;
       } else if (type === 'start') {
         this.isPlaying = true;
+        console.log('[PlaybackWorklet] Playback started');
       } else if (type === 'stop') {
         this.isPlaying = false;
         this.buffer = [];
         this.currentChunk = null;
         this.readOffset = 0;
+        this.chunksReceived = 0;
+        console.log('[PlaybackWorklet] Playback stopped');
       }
     };
   }
@@ -89,58 +109,95 @@ class PlaybackWorklet extends AudioWorkletProcessor {
       const blockLocalStartTime = (this.timeOrigin || 0) + (this.performanceNow || 0) + systemTimeElapsed;
 
       for (let i = 0; i < frameCount; i++) {
-        // 1. Smoothly interpolate playback rate (Exp-Lerp)
-        this.actualRate = (this.actualRate * 0.99) + (this.playbackRate * 0.01);
+        // 1. Smoothly interpolate playback rate with proper anti-aliasing [Sync v6.7]
+        // Use low-pass filter (τ = 5ms, ~32Hz cutoff) to prevent pitch artifacts
+        // Formula: y += (target - y) * (1 - exp(-t/τ))
+        const tau = 0.005; // 5ms time constant in seconds
+        const dt = 1 / sampleRate;
+        const alpha = 1 - Math.exp((-2 * Math.PI * dt) / tau);
+        this.actualRate = this.actualRate + (this.playbackRate - this.actualRate) * alpha;
 
         // 2. If we don't have a chunk, try to find the next one
         if (!this.currentChunk && this.buffer.length > 0) {
-          const sampleLocalTime = blockLocalStartTime + (i * msPerSample);
-          const sampleSharedTime = this.getSharedTime(sampleLocalTime);
+          const sampleContextTime = currentTime + (i / sampleRate);
 
-          // Find the right chunk or skip late ones
+          // Find the right chunk
           while (this.buffer.length > 0) {
             const nextChunk = this.buffer[0];
-            // [Sync v6.5] Catch-up Logic
-            // If the chunk is more than 500ms in the past, skip it immediately
-            if (sampleSharedTime > nextChunk.targetPlayTime + 500) {
-              this.buffer.shift();
-              continue;
-            }
-            // Allow 100ms jitter window for clock sync tolerance
-            if (sampleSharedTime >= nextChunk.targetPlayTime - 100) {
+            
+            // Allow 50ms jitter window for context time tolerance
+            if (sampleContextTime >= nextChunk.playAtContextTime - 0.050) {
               this.currentChunk = this.buffer.shift();
               this.readOffset = 0;
               break;
+            } else {
+              // Too early
+              break;
             }
-            // If it's too early for the first chunk, wait
-            break;
           }
         }
 
         // 3. Play sample if chunk is active
         if (this.currentChunk && this.currentChunk.data) {
           const intOffset = Math.floor(this.readOffset);
+          const frac = this.readOffset - intOffset;
           const dataIdx = intOffset * 2;
 
-          // Bounds check for safety
-          if (dataIdx >= 0 && dataIdx + 1 < this.currentChunk.data.length) {
-            left[i] = this.currentChunk.data[dataIdx];
-            right[i] = this.currentChunk.data[dataIdx + 1];
+          let l, r;
+
+          // [Sync v6.9] Cross-Chunk Linear Interpolation
+          if (dataIdx >= 0 && dataIdx + 3 < this.currentChunk.data.length) {
+            // Standard intra-chunk interpolation
+            const l1 = this.currentChunk.data[dataIdx];
+            const r1 = this.currentChunk.data[dataIdx + 1];
+            const l2 = this.currentChunk.data[dataIdx + 2];
+            const r2 = this.currentChunk.data[dataIdx + 3];
+            l = l1 + (l2 - l1) * frac;
+            r = r1 + (r2 - r1) * frac;
+          } else if (dataIdx >= 0 && dataIdx + 1 < this.currentChunk.data.length) {
+            // Edge case: Interpolate between this chunk's last sample and next chunk's first
+            const l1 = this.currentChunk.data[dataIdx];
+            const r1 = this.currentChunk.data[dataIdx + 1];
+            
+            if (this.buffer.length > 0 && this.buffer[0].data) {
+              const l2 = this.buffer[0].data[0];
+              const r2 = this.buffer[0].data[1];
+              l = l1 + (l2 - l1) * frac;
+              r = r1 + (r2 - r1) * frac;
+            } else {
+              l = l1; r = r1;
+            }
           } else {
-            left[i] = 0;
-            right[i] = 0;
+            l = 0; r = 0;
           }
+
+          // Apply Surround Masking on the audio thread
+          if (this.surroundMask === 'left') r = 0;
+          else if (this.surroundMask === 'right') l = 0;
+          else if (this.surroundMask === 'center' || this.surroundMask === 'lfe') {
+            const mix = (l + r) * 0.707;
+            l = mix; r = mix;
+          }
+
+          left[i] = l;
+          right[i] = r;
 
           this.readOffset += this.actualRate;
 
           if (this.readOffset >= this.currentChunk.data.length / 2) {
+            // [Sync v6.9] Carry over fractional offset to next chunk to prevent phase shifts
+            this.readOffset -= (this.currentChunk.data.length / 2);
             this.currentChunk = null;
-            this.readOffset = 0;
           }
         } else {
           // Starvation/Waiting
           left[i] = 0;
           right[i] = 0;
+
+          if (this.isPlaying && this.chunksReceived > 0 && now - this.lastStarveLog > 3000) {
+            console.warn(`[PlaybackWorklet] Buffer starvation detected (samples requested but no chunks ready)`);
+            this.lastStarveLog = now;
+          }
         }
       }
     } catch (err) {

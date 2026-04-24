@@ -8,6 +8,7 @@ import { audioCapture } from './audioCapture.js';
 import { HEADER_SIZE, CHUNK_DURATION_MS } from '../utils/constants.js';
 import { EventEmitter } from '../utils/helpers.js';
 import { appState } from '../main.js';
+import { audioPlayer } from './audioPlayer.js';
 
 class AudioStreamer extends EventEmitter {
   constructor() {
@@ -193,12 +194,17 @@ class AudioStreamer extends EventEmitter {
       console.log(`[AudioStreamer] Chunk #${seq} | UDP reached: ${sentViaUDP} nodes | WS fallback: ${sentViaUDP === 0 || appState.devices.length > 1}`);
     }
     
-    // Always send via WebSocket if UDP reached 0 nodes, OR if we want to ensure
-    // every node gets the chunk even if their UDP is firewalled.
-    // [Optimization] Only send via WS if nodes are actually connected to the server.
-    if (sentViaUDP === 0 || appState.devices.length > 1) {
-      if (Math.random() < 0.01) console.log('[AudioStreamer] Sending chunk via WebSocket fallback');
+    // [Sync v6.2.9] Hardened Reliability: Always send via WebSocket as a primary fallback
+    // This ensures audio works on mobile networks where WebRTC (UDP) is often throttled.
+    const hasNodes = appState.devices.some(d => d.role === 'node');
+    if (sentViaUDP === 0 || hasNodes) {
+      if (this.chunksSent % 200 === 0) console.log(`[AudioStreamer] WS Fallback Active (UDP reached ${sentViaUDP} nodes)`);
       wsClient.sendBinary(packet.buffer);
+    }
+
+    // [Sync v6.6] Host Loopback: If monitoring is ON, feed the local player
+    if (audioPlayer.isPlaying) {
+      audioPlayer.receiveChunk(packet.buffer);
     }
 
     this.chunksSent++;

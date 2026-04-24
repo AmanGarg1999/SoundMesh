@@ -28,7 +28,7 @@ export class JitterBuffer {
   /**
    * Add a chunk to the buffer (sorted insertion)
    */
-  add(chunk) {
+  add(chunk, rtt = 0) {
     this.totalReceived++;
 
     // Track arrival time for variance calculation
@@ -62,8 +62,8 @@ export class JitterBuffer {
       this.buffer.unshift(chunk);
     }
 
-    // Adapt buffer depth based on arrival variance
-    this.adaptDepth();
+    // Adapt buffer depth based on arrival variance and RTT
+    this.adaptDepth(rtt);
 
     // Trim if over max depth
     const maxChunks = Math.ceil(this.maxDepthMs / CHUNK_DURATION_MS);
@@ -101,9 +101,10 @@ export class JitterBuffer {
   }
 
   /**
-   * Adapt buffer depth based on inter-arrival time variance
+   * Adapt buffer depth based on inter-arrival time variance and network RTT [Sync v6.8]
+   * Incorporates RTT to ensure the buffer is deep enough for the current network path.
    */
-  adaptDepth() {
+  adaptDepth(rtt = 0) {
     if (this.arrivalTimes.length < 10) return;
 
     // Calculate inter-arrival time variance
@@ -117,12 +118,19 @@ export class JitterBuffer {
       intervals.reduce((sum, t) => sum + Math.pow(t - mean, 2), 0) / intervals.length
     );
 
-    // If variance is high, expand buffer
-    if (variance > JITTER_EXPAND_THRESHOLD) {
-      this.targetDepthMs = Math.min(this.maxDepthMs, this.targetDepthMs + 5); // Slower growth
-    } else {
-      // Very slowly shrink back toward minimum
-      this.targetDepthMs = Math.max(this.minDepthMs, this.targetDepthMs - 0.5);
+    // [Sync v6.8] Intelligent Tuning Logic
+    // We target a depth that covers 2.5x the jitter variance OR 0.5x the RTT, whichever is higher.
+    const rttFloor = rtt * 0.5;
+    const jitterTarget = variance * 2.5;
+    const idealDepth = Math.max(this.minDepthMs, Math.min(this.maxDepthMs, Math.max(jitterTarget, rttFloor)));
+
+    // Smoothly transition toward the ideal depth
+    if (this.targetDepthMs < idealDepth) {
+      // Expand quickly to avoid drops (1ms per chunk)
+      this.targetDepthMs = Math.min(this.maxDepthMs, this.targetDepthMs + 1.0);
+    } else if (this.targetDepthMs > idealDepth) {
+      // Shrink very slowly to maintain stability (0.1ms per chunk)
+      this.targetDepthMs = Math.max(this.minDepthMs, this.targetDepthMs - 0.1);
     }
   }
 
