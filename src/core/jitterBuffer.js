@@ -22,8 +22,11 @@ export class JitterBuffer {
     this.gapCount = 0;
     this.duplicateCount = 0;
     this.lastSeq = -1;
-    this.seenSeqs = new Set(); // [Sync v7.0] Global duplicate detection
+    this.seenSeqs = new Map(); // [Sync v8.0] seq -> arrivalTime
     this.totalReceived = 0;
+
+    // [Sync v9.0] Gap callback — fired with missing sequence numbers for NACK retransmission
+    this.onGap = null;
   }
 
   /**
@@ -31,20 +34,28 @@ export class JitterBuffer {
    */
   add(chunk, rtt = 0) {
     this.totalReceived++;
+    const now = performance.now();
 
-    // [Sync v7.0] Hardened Duplicate Detection
-    // Check both current buffer and historical "seen" list
-    if (this.seenSeqs.has(chunk.seq) || this.buffer.some(c => c.seq === chunk.seq)) {
+    // [Sync v8.0] Hardened Duplicate Detection
+    // Check historical "seen" list (Map ensures O(1) lookup)
+    if (this.seenSeqs.has(chunk.seq)) {
       this.duplicateCount++;
       return;
     }
 
-    // Track sequence in history
-    this.seenSeqs.add(chunk.seq);
-    if (this.seenSeqs.size > 200) {
-      // Keep history window manageable (approx 1s of audio)
-      const first = this.seenSeqs.values().next().value;
-      this.seenSeqs.delete(first);
+    // Track sequence in history with arrival time
+    this.seenSeqs.set(chunk.seq, now);
+    
+    // Periodically prune history (every 100 chunks or if history is too large)
+    if (this.totalReceived % 100 === 0 || this.seenSeqs.size > 2000) {
+      for (const [seq, time] of this.seenSeqs.entries()) {
+        // Keep 30 seconds of history to handle extreme network re-ordering
+        if (now - time > 30000) {
+          this.seenSeqs.delete(seq);
+        } else {
+          break; // Map maintains insertion order, so we can stop at the first "young" entry
+        }
+      }
     }
 
     // Track arrival time for variance calculation
@@ -53,15 +64,20 @@ export class JitterBuffer {
       this.arrivalTimes.shift();
     }
 
-    // Duplicate detection
-    if (this.buffer.some(c => c.seq === chunk.seq)) {
-      this.duplicateCount++;
-      return;
-    }
+
 
     // Gap detection
     if (this.lastSeq >= 0 && chunk.seq > this.lastSeq + 1) {
-      this.gapCount += (chunk.seq - this.lastSeq - 1);
+      const gapSize = chunk.seq - this.lastSeq - 1;
+      this.gapCount += gapSize;
+
+      // [Sync v9.0] Fire NACK callback for each missing sequence number.
+      // Capped at 10 NACKs per gap to avoid flooding on massive sequence jumps.
+      if (this.onGap && gapSize <= 10) {
+        for (let s = this.lastSeq + 1; s < chunk.seq; s++) {
+          this.onGap(s);
+        }
+      }
     }
     this.lastSeq = Math.max(this.lastSeq, chunk.seq);
 

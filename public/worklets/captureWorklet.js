@@ -43,12 +43,14 @@ class CaptureWorkletProcessor extends AudioWorkletProcessor {
 
       // If buffer is full, send chunk to main thread
       if (this.currentOffset >= this.bufferSize) {
-        // Copy buffer to avoid transfer issues
-        const chunk = new Float32Array(this.sampleBuffer);
+        // [Performance] Zero-Copy Transfer
+        // We slice and send the buffer as a transferable to eliminate main-thread GC pressure.
+        const chunk = this.sampleBuffer.slice(0, this.bufferSize * this.channels);
         this.port.postMessage({
           type: 'audio_chunk',
-          samples: chunk
-        });
+          samples: chunk,
+          timestamp: currentTime
+        }, [chunk.buffer]);
         
         // Reset offset
         this.currentOffset = 0;

@@ -2,7 +2,7 @@
 // Receives PCM audio chunks from the Host and fans out to all Node WebSockets
 // Stores a ring buffer of recent chunks for retransmission on NACK
 
-const RING_BUFFER_SIZE = 100; // Store last 100 chunks for retransmission
+const RING_BUFFER_SIZE = 200; // Store last 200 chunks for retransmission (Sync v7.6)
 const HEADER_SIZE = 16;      // [seq:4][target:8][mask:2][flags:2]
 
 export class AudioRelay {
@@ -22,6 +22,19 @@ export class AudioRelay {
    * Total header: 16 bytes
    */
   relay(data, senderWs, wss, deviceRegistry) {
+    // [Sync v9.0] Security: Only accept audio from the current host.
+    // Without this, any connected client could inject audio into the stream.
+    if (deviceRegistry) {
+      const hostDevice = deviceRegistry.getHost();
+      if (hostDevice && senderWs.deviceId !== hostDevice.deviceId) {
+        if (!this._lastRejectLog || Date.now() - this._lastRejectLog > 5000) {
+          console.warn(`[AudioRelay] Rejected audio from non-host device: ${senderWs.deviceId} (host is ${hostDevice.deviceId})`);
+          this._lastRejectLog = Date.now();
+        }
+        return;
+      }
+    }
+    
     // Store in ring buffer for retransmission
     const buffer = Buffer.from(data);
     const seq = buffer.readUInt32LE(0);
@@ -34,29 +47,31 @@ export class AudioRelay {
     const oldestSeq = seq - RING_BUFFER_SIZE;
     this.chunkMap.delete(oldestSeq);
 
-    // Fan out to all connected devices without blocking the Node.js event loop
-    const clients = Array.from(wss.clients);
-    const CHUNK_SIZE = 10;
-    let i = 0;
-
-    const processChunk = () => {
-      const end = Math.min(i + CHUNK_SIZE, clients.length);
-      for (; i < end; i++) {
-        const client = clients[i];
-        // Don't send back to the sender (Host) and only send to open sockets
-        if (client !== senderWs && client.readyState === 1) {
-          client.send(data, { binary: true });
+    // [Sync v8.0] Immediate Fan-out with Backpressure
+    // We send to all nodes in a single tick to ensure phase-alignment across the mesh.
+    // If a client's kernel buffer is full (false return from send), we skip it for this 
+    // chunk to avoid server-side memory bloat and late "stale" delivery.
+    wss.clients.forEach((client) => {
+      // Don't send back to the sender (Host) and only send to open sockets
+      if (client !== senderWs && client.readyState === 1) {
+        // [Sync v8.2] Hardened Backpressure Detection
+        // ws.send() returns void in the 'ws' library. We must check bufferedAmount.
+        // If the buffer is > 1MB, we consider the client congested and drop chunks 
+        // to prevent server-side memory bloat.
+        if (client.bufferedAmount > 1024 * 1024) {
+          client.droppedChunks = (client.droppedChunks || 0) + 1;
+          if (client.droppedChunks % 50 === 0) {
+            console.warn(`[AudioRelay] Client ${client.deviceId} is TRULY congested (>1MB). Dropped ${client.droppedChunks} chunks.`);
+          }
+          return; // Skip sending to this congested client
         }
-      }
-      if (i < clients.length) {
-        setImmediate(processChunk);
-      }
-    };
 
-    processChunk();
+        client.send(data, { binary: true });
+      }
+    });
     
     if (this.stats.chunksRelayed % 100 === 0) {
-      console.log(`[AudioRelay] Relayed chunk #${seq} to ${clients.length - 1} clients`);
+      console.log(`[AudioRelay] Relayed chunk #${seq} to all clients immediately.`);
     }
 
     this.stats.chunksRelayed++;

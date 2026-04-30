@@ -210,33 +210,48 @@ class AudioCapture extends EventEmitter {
 
     this.workletNode = new AudioWorkletNode(this.audioContext, 'capture-worklet');
 
+    // [Sync v8.2] Capture Watchdog
+    // If we're capturing but not receiving chunks, the AudioContext is likely stalled.
+    let lastChunkTime = Date.now();
     this.workletNode.port.onmessage = (event) => {
       if (event.data.type === 'audio_chunk') {
+        lastChunkTime = Date.now();
         const { samples } = event.data;
-
-        // Convert float32 to int16 for efficient transport
         const chunkInt16 = float32ToInt16(samples);
         
-        // Diagnostic: Check peak volume
         let peak = 0;
         for (let i = 0; i < samples.length; i++) {
           const abs = Math.abs(samples[i]);
           if (abs > peak) peak = abs;
         }
         
-        if (this.sequenceNumber % 100 === 0) {
-          console.log(`[AudioCapture] Emitting chunk #${this.sequenceNumber} | Peak: ${peak.toFixed(4)}`);
+        if (this.sequenceNumber % 50 === 0) {
+          console.log(`[AudioCapture] Received chunk #${this.sequenceNumber} from worklet. Peak: ${peak.toFixed(4)}`);
         }
 
-        // Emit the chunk
         this.emit('audio_chunk', {
           seq: this.sequenceNumber++,
           pcmData: chunkInt16,
           sampleRate: SAMPLE_RATE,
           channels: CHANNELS,
+          workletTimestamp: event.data.timestamp
         });
       }
     };
+
+    if (this.watchdogInterval) clearInterval(this.watchdogInterval);
+    this.watchdogInterval = setInterval(() => {
+      if (this.isCapturing && (Date.now() - lastChunkTime > 2000)) {
+        console.warn(`[AudioCapture] Watchdog detected STALL (no chunks for 2s). Attempting to kickstart...`);
+        if (this.audioContext && this.audioContext.state === 'suspended') {
+          this.audioContext.resume();
+        }
+        // Force a message to the worklet to wake it up
+        if (this.workletNode) {
+          this.workletNode.port.postMessage({ type: 'start' });
+        }
+      }
+    }, 1000);
 
     // Tell worklet to configure and start
     this.workletNode.port.postMessage({
@@ -268,6 +283,11 @@ class AudioCapture extends EventEmitter {
   stop() {
     this.isCapturing = false;
     insomnia.deactivate();
+
+    if (this.watchdogInterval) {
+      clearInterval(this.watchdogInterval);
+      this.watchdogInterval = null;
+    }
 
     if (this.fileSourceNode) {
       try { this.fileSourceNode.stop(); } catch (e) {}

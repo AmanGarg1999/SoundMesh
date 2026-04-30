@@ -47,7 +47,8 @@ class CaptureWorkletProcessor extends AudioWorkletProcessor {
         const chunk = new Float32Array(this.sampleBuffer);
         this.port.postMessage({
           type: 'audio_chunk',
-          samples: chunk
+          samples: chunk,
+          timestamp: currentTime
         });
         
         // Reset offset

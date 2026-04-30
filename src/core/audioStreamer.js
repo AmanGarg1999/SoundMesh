@@ -21,6 +21,30 @@ class AudioStreamer extends EventEmitter {
     this.useOpus = false; // Emergency Revert: Disable Opus by default for stability
     this.encoder = null;
     this.seqMap = new Map(); // Map microsecond timestamp -> sequence number
+    this.lastGlobalBuffer = 0;
+    
+    // [Sync v7.6] Listen for session-wide buffer changes
+    wsClient.on('global_buffer_update', (payload) => {
+      const newBuffer = payload.globalBuffer;
+      const diff = Math.abs(newBuffer - this.lastGlobalBuffer);
+      
+      if (this.isStreaming && diff > 10) {
+        console.log(`[AudioStreamer] Global buffer shifted significantly (${this.lastGlobalBuffer}ms -> ${newBuffer}ms). Re-anchoring...`);
+        this.lastGlobalBuffer = newBuffer;
+        this.forceReanchor();
+      } else {
+        this.lastGlobalBuffer = newBuffer;
+      }
+    });
+  }
+
+  /**
+   * Manually force a re-anchor of the analytic timestamp baseline.
+   * Useful when session-wide latency targets change.
+   */
+  forceReanchor() {
+    this.baseSequence = null;
+    this.baseSharedTime = null;
   }
 
   /**
@@ -100,21 +124,35 @@ class AudioStreamer extends EventEmitter {
   handleChunk = (chunk) => {
     const { seq, pcmData } = chunk;
 
-    // Calculate target play time analytically
-    // By anchoring to the first chunk, we completely eliminate event-loop jitter from our timestamps
-    // [Sync v6.2.2] Periodic Re-Anchoring
-    // Every 1000 chunks, we re-anchor our analytic timestamps to the real clock.
-    // This prevents long-term drift from accumulating if the hardware sample rate 
-    // is slightly different than the theoretical 48000Hz.
-    if (this.baseSequence === null || seq % 1000 === 0) {
+    // [Sync v9.0] Continuous Drift Correction (replaces hard re-anchor every 1000 chunks)
+    // The old approach re-anchored baseSharedTime every 1000 chunks (~20s), creating
+    // a timestamp discontinuity that nodes had to absorb as a phase jump.
+    // The new approach anchors once and continuously blends real clock time to prevent
+    // long-term drift from hardware sample rate deviations (20-100 ppm).
+    if (this.baseSequence === null) {
       this.baseSequence = seq;
-      // Add extra padding for Opus encoder lookahead/processing
+      const workletNow = chunk.workletTimestamp || (audioCapture.audioContext.currentTime);
+      const currentAudioTime = audioCapture.audioContext.currentTime;
+      const currentSharedTime = clockSync.getSharedTime();
+      
+      const audioToSharedOffset = currentSharedTime - (currentAudioTime * 1000);
+      
       const codecPadding = this.useOpus ? 20 : 0;
-      this.baseSharedTime = clockSync.getSharedTime() + clockSync.getGlobalBuffer() + codecPadding;
-      if (seq > 0) console.log(`[AudioStreamer] Re-anchored sync at seq ${seq}`);
+      this.baseSharedTime = (workletNow * 1000) + audioToSharedOffset + clockSync.getGlobalBuffer() + codecPadding;
+      if (seq > 0) console.log(`[AudioStreamer] Initial anchor set at seq ${seq}`);
     }
 
-    const targetPlayTime = this.baseSharedTime + ((seq - this.baseSequence) * CHUNK_DURATION_MS);
+    if (seq % 100 === 0) {
+      console.log(`[AudioStreamer] Processing chunk #${seq} | pcmData length: ${pcmData.length}`);
+    }
+
+    // Analytical time based on constant chunk duration
+    const analyticalTime = this.baseSharedTime + ((seq - this.baseSequence) * CHUNK_DURATION_MS);
+    
+    // [Sync v9.0] Continuous blend: 99.9% analytical + 0.1% real clock each chunk.
+    // This smoothly absorbs hardware clock drift without creating discontinuities.
+    const realTime = clockSync.getSharedTime() + clockSync.getGlobalBuffer() + (this.useOpus ? 20 : 0);
+    const targetPlayTime = analyticalTime * 0.999 + realTime * 0.001;
 
     if (this.useOpus && this.encoder && this.encoder.state === 'configured') {
       try {
@@ -194,11 +232,17 @@ class AudioStreamer extends EventEmitter {
       console.log(`[AudioStreamer] Chunk #${seq} | UDP reached: ${sentViaUDP} nodes | WS fallback: ${sentViaUDP === 0 || appState.devices.length > 1}`);
     }
     
-    // [Sync v6.2.9] Hardened Reliability: Always send via WebSocket as a primary fallback
-    // This ensures audio works on mobile networks where WebRTC (UDP) is often throttled.
-    const hasNodes = appState.devices.some(d => d.role === 'node');
-    if (sentViaUDP === 0 || hasNodes) {
-      if (this.chunksSent % 200 === 0) console.log(`[AudioStreamer] WS Fallback Active (UDP reached ${sentViaUDP} nodes)`);
+    // [Sync v7.6] Hybrid Broadcast Logic
+    // We send via UDP to everyone who has an open channel.
+    // If the number of nodes reached via UDP is less than the total node count,
+    // we MUST fallback to WebSocket (TCP) to ensure new/firewalled nodes get audio.
+    const nodes = appState.devices.filter(d => d.role === 'node');
+    const nodeCount = nodes.length;
+
+    if (sentViaUDP < nodeCount) {
+      if (this.chunksSent % 200 === 0) {
+        console.log(`[AudioStreamer] WS Fallback Active (UDP reached ${sentViaUDP}/${nodeCount} nodes)`);
+      }
       wsClient.sendBinary(packet.buffer);
     }
 

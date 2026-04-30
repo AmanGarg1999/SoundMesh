@@ -13,6 +13,7 @@ import { renderPlacementGrid } from './placementGrid.js';
 import { renderSyncMonitor } from './syncMonitor.js';
 import { getPlatformIcon } from '../utils/helpers.js';
 import { youtubeUI } from './youtubeUI.js';
+import { audioPlayer } from '../core/audioPlayer.js';
 
 let waveformCleanup = null;
 let statsInterval = null;

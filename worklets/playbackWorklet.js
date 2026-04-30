@@ -13,11 +13,13 @@ class PlaybackWorklet extends AudioWorkletProcessor {
     this.currentChunk = null;
     this.readOffset = 0; // Floating point read offset for interpolation
     
-    // External clock state (ms)
-    this.globalOffset = 0;
-    this.globalSkew = 0;
-    this.lastSyncTime = 0;
-    this.isPlaying = false;
+    // Internal Clock Smoothing
+    this.smoothedAnchorContextTime = 0;
+    this.smoothedAnchorSharedTime = 0;
+    this.isAnchored = false;
+    this.targetAnchorContextTime = 0;
+    this.targetAnchorSharedTime = 0;
+
     this.lastHeartbeat = 0;
     this.bufferSize = 240; // Default
 
@@ -31,15 +33,25 @@ class PlaybackWorklet extends AudioWorkletProcessor {
         // Keep queue size stable (approx 1 second of buffer max)
         if (this.buffer.length > 50) this.buffer.shift();
       } else if (type === 'sync_update') {
-        this.globalOffset = payload.offset;
-        this.globalSkew = payload.skew;
-        this.lastSyncTime = payload.lastSyncTime;
-        this.timeOrigin = payload.timeOrigin;
+        // [Sync v8.2] Smoothed Anchor Transition
+        // To prevent audible jumps (micro-jitter) when a new sync anchor arrives,
+        // we don't snap immediately. We store the new target and blend toward it.
+        if (!this.isAnchored) {
+          this.smoothedAnchorContextTime = payload.anchorContextTime;
+          this.smoothedAnchorSharedTime = payload.anchorSharedTime;
+          this.targetAnchorContextTime = payload.anchorContextTime;
+          this.targetAnchorSharedTime = payload.anchorSharedTime;
+          this.isAnchored = true;
+        } else {
+          this.targetAnchorContextTime = payload.anchorContextTime;
+          this.targetAnchorSharedTime = payload.anchorSharedTime;
+        }
         
-        // [Sync v6.2] High-Precision Clock Alignment
-        // We capture the relationship between real system time and audio context time
-        this.performanceNow = payload.performanceNow;
-        this.audioContextTime = payload.audioContextTime;
+        // Update drift parameters
+        this.globalOffset = payload.globalOffset;
+        this.globalSkew = payload.globalSkew;
+        this.lastSyncTime = payload.lastSyncTime;
+        this.playbackRate = payload.playbackRate;
       } else if (type === 'set_rate') {
         this.playbackRate = payload;
       } else if (type === 'start') {
@@ -81,48 +93,80 @@ class PlaybackWorklet extends AudioWorkletProcessor {
       const frameCount = left.length;
       const msPerSample = 1000 / sampleRate;
 
-      // [Sync v6.2.2] Re-anchor local time to Unix Absolute Time
-      // This is CRITICAL. blockLocalStartTime must be in the same domain as this.lastSyncTime (Unix ms).
-      const localAudioTimeMs = currentTime * 1000;
-      const systemTimeElapsed = localAudioTimeMs - (this.audioContextTime || 0);
-      const hostPerformanceNow = this.performanceNow || 0; 
-      const blockLocalStartTime = (this.timeOrigin || 0) + hostPerformanceNow + systemTimeElapsed;
+      // [Sync v7.5] Calculate block start time using the stable anchor
+      if (!this.isAnchored) return true;
+
+      const elapsedContextS = currentTime - this.smoothedAnchorContextTime;
+      
+      // [Sync v8.2] Anchor Convergence Logic
+      // Every block, we gently pull our smoothed anchor toward the latest target anchor
+      // from the main thread. This eliminates the 20ms "snap" glitches.
+      if (this.targetAnchorContextTime !== this.smoothedAnchorContextTime) {
+        // 1. Project our current smoothed anchor forward to the target context time
+        const dt = this.targetAnchorContextTime - this.smoothedAnchorContextTime;
+        const projectedSharedTime = this.smoothedAnchorSharedTime + (dt * 1000 * this.actualRate);
+        
+        // 2. Calculate the error between our projection and the master ground truth
+        const error = this.targetAnchorSharedTime - projectedSharedTime;
+        
+        // 3. Move the anchor to the target context time, but only apply a fraction of the error
+        // This effectively "bleeds" the sync jump over several blocks (~25ms).
+        this.smoothedAnchorSharedTime = projectedSharedTime + (error * 0.1);
+        this.smoothedAnchorContextTime = this.targetAnchorContextTime;
+      }
+
+      // [Sync v8.0] Active Drift Compensation
+      // We scale the elapsed context time by our calculated playback rate.
+      const blockSharedTime = this.smoothedAnchorSharedTime + (elapsedContextS * 1000 * this.actualRate);
 
       for (let i = 0; i < frameCount; i++) {
           // 1. Smoothly interpolate playback rate (Exp-Lerp)
-          this.actualRate = (this.actualRate * 0.99) + (this.playbackRate * 0.01);
+          this.actualRate = (this.actualRate * 0.999) + (this.playbackRate * 0.001);
 
-          // 2. If we don't have a chunk, try to find the next one
-          if (!this.currentChunk) {
-              const sampleSharedTime = this.getSharedTime(blockLocalStartTime + (i * msPerSample));
-              
-              // Skip multiple chunks if they are all in the past (Catch-up logic)
-              while (this.buffer.length > 0) {
-                  const nextChunk = this.buffer[0];
-                  // Allow a 40ms jitter window for stability
-                  if (sampleSharedTime >= nextChunk.targetPlayTime - 40) {
-                      this.currentChunk = this.buffer.shift();
-                      this.readOffset = 0;
-                      
-                      // If this chunk is already mostly played by our current sample clock, 
-                      // skip further to catch up if we have more chunks
-                      if (sampleSharedTime > nextChunk.targetPlayTime + 40 && this.buffer.length > 0) {
-                        continue; // Try next chunk
-                      }
-                      break; 
-                  } else {
-                    break; // Next chunk is in the future
-                  }
+          const sampleSharedTime = blockSharedTime + (i * msPerSample * this.actualRate);
+
+          // 2. Sample Alignment Logic
+          // We find the chunk that contains the current sampleSharedTime
+          while (this.buffer.length > 0) {
+              const chunk = this.buffer[0];
+              const sampleOffset = (sampleSharedTime - chunk.targetPlayTime) / msPerSample;
+
+              if (sampleOffset < 0) {
+                  // This sample is in the future relative to the next chunk.
+                  // Wait (play silence).
+                  this.currentChunk = null;
+                  break;
+              } else if (sampleOffset >= this.bufferSize) {
+                  // This chunk is entirely in the past. Drop it.
+                  this.buffer.shift();
+                  continue;
+              } else {
+                  // We found the chunk!
+                  this.currentChunk = chunk;
+                  this.readOffset = sampleOffset;
+                  break;
               }
           }
 
           // 3. Play sample if chunk is active
           if (this.currentChunk && this.currentChunk.data) {
               const intOffset = Math.floor(this.readOffset);
+              const frac = this.readOffset - intOffset;
               const dataIdx = intOffset * 2;
+              const nextIdx = (intOffset + 1) * 2;
 
               // Bounds check for safety
-              if (dataIdx >= 0 && dataIdx + 1 < this.currentChunk.data.length) {
+              if (dataIdx >= 0 && nextIdx + 1 < this.currentChunk.data.length) {
+                // Left channel
+                const l0 = this.currentChunk.data[dataIdx];
+                const l1 = this.currentChunk.data[nextIdx];
+                left[i] = l0 + frac * (l1 - l0);
+
+                // Right channel
+                const r0 = this.currentChunk.data[dataIdx + 1];
+                const r1 = this.currentChunk.data[nextIdx + 1];
+                right[i] = r0 + frac * (r1 - r0);
+              } else if (dataIdx >= 0 && dataIdx + 1 < this.currentChunk.data.length) {
                 left[i] = this.currentChunk.data[dataIdx];
                 right[i] = this.currentChunk.data[dataIdx + 1];
               } else {
@@ -130,12 +174,9 @@ class PlaybackWorklet extends AudioWorkletProcessor {
                 right[i] = 0;
               }
 
-              this.readOffset += this.actualRate;
-
-              if (this.readOffset >= this.currentChunk.data.length / 2) {
-                  this.currentChunk = null;
-                  this.readOffset = 0;
-              }
+              // In Phase-Locked mode, we don't increment readOffset manually.
+              // It's recalculated every iteration based on the shared clock.
+              // this.readOffset += this.actualRate;
           } else {
               // Starvation/Waiting
               left[i] = 0;

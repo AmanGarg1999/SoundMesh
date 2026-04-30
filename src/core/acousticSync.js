@@ -97,6 +97,14 @@ class AcousticSync extends EventEmitter {
    */
   async startHostCalibration(targetDeviceId = null) {
     if (this.isCalibrating) return;
+    
+    // [Sync v7.6] Sync Guard: Don't calibrate if clock isn't stable
+    if (clockSync.getStatus() !== 'in_sync') {
+      console.warn('[AuraSync] Cannot start calibration: Clock is not in sync.');
+      this.emit('error', 'Clock sync is not stable yet. Please wait a few seconds.');
+      return;
+    }
+    
     this.isCalibrating = true;
 
     // [User Gesture Check] Browsers require a direct click to resume AudioContext.
@@ -142,6 +150,13 @@ class AcousticSync extends EventEmitter {
     // NODE: Listen for pulses
     async startDetection(startTime, interval, count) {
       if (this.isCalibrating) return;
+      
+      // [Sync v7.6] Sync Guard
+      if (clockSync.getStatus() !== 'in_sync') {
+        console.warn('[AuraSync] Detection request ignored: Local clock not in sync.');
+        return;
+      }
+      
       this.isCalibrating = true;
       this.detectedOffsets = [];
   
@@ -222,7 +237,7 @@ class AcousticSync extends EventEmitter {
                 index, 
                 total: count, 
                 percent: progressPercent,
-                offset: calibratedOffset 
+                offset: rawOffset 
               });
             }
           }

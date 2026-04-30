@@ -11,6 +11,12 @@ class WebRTCManager extends EventEmitter {
     this.dataChannels = new Map(); // targetDeviceId -> RTCDataChannel
     this.pendingCandidates = new Map(); // targetDeviceId -> RTCIceCandidate[]
     
+    // [Sync v9.0] Auto-reconnection state
+    this._initiatedConnections = new Set(); // Track which connections we initiated
+    this._reconnectAttempts = new Map(); // deviceId -> attempt count
+    this._reconnectTimers = new Map(); // deviceId -> timeout ID
+    this._maxReconnectAttempts = 5;
+    
     // Standard STUN servers for network traversal (mostly Local LAN usage though)
     this.iceConfig = {
       iceServers: [
@@ -24,13 +30,22 @@ class WebRTCManager extends EventEmitter {
    * Node: Initiate connection to Host
    */
   async initConnection(targetDeviceId) {
+    // [Sync v9.0] Track that we initiated this connection (for auto-reconnect)
+    this._initiatedConnections.add(targetDeviceId);
+    
+    // Cancel any pending reconnect timer for this device
+    if (this._reconnectTimers.has(targetDeviceId)) {
+      clearTimeout(this._reconnectTimers.get(targetDeviceId));
+      this._reconnectTimers.delete(targetDeviceId);
+    }
+
     if (this.peers.has(targetDeviceId)) {
       const peer = this.peers.get(targetDeviceId);
       if (peer.connectionState === 'connected' || peer.connectionState === 'connecting') {
         console.log(`[WebRTC] Connection to ${targetDeviceId} already exists or is in progress. Skipping.`);
         return;
       }
-      this.cleanup(targetDeviceId);
+      this.cleanup(targetDeviceId, false); // Don't trigger reconnect from explicit init
     }
 
     console.log(`[WebRTC] Initiating connection to ${targetDeviceId}...`);
@@ -161,6 +176,7 @@ class WebRTCManager extends EventEmitter {
     dc.onopen = () => {
       console.log(`[WebRTC] DataChannel OPEN with ${deviceId} (${dc.label})`);
       this.dataChannels.set(deviceId, dc);
+      this._resetReconnectCounter(deviceId); // [Sync v9.0] Success — reset backoff
       this.emit('connection_ready', deviceId);
       this.emit('channel_open', deviceId);
     };
@@ -217,8 +233,10 @@ class WebRTCManager extends EventEmitter {
 
   /**
    * Gracefully close and remove a peer connection
+   * @param {string} deviceId
+   * @param {boolean} attemptReconnect - If true, schedule auto-reconnection (default: true)
    */
-  cleanup(deviceId) {
+  cleanup(deviceId, attemptReconnect = true) {
     console.log(`[WebRTC] Cleaning up connection for ${deviceId}`);
     
     // Close data channel
@@ -236,6 +254,55 @@ class WebRTCManager extends EventEmitter {
     }
 
     this.pendingCandidates.delete(deviceId);
+
+    // [Sync v9.0] Auto-reconnect if we originally initiated the connection
+    if (attemptReconnect && this._initiatedConnections.has(deviceId)) {
+      this._scheduleReconnect(deviceId);
+    }
+  }
+
+  /**
+   * [Sync v9.0] Schedule a WebRTC reconnection with exponential backoff.
+   * Capped at _maxReconnectAttempts to prevent infinite loops.
+   */
+  _scheduleReconnect(deviceId) {
+    const attempts = this._reconnectAttempts.get(deviceId) || 0;
+    
+    if (attempts >= this._maxReconnectAttempts) {
+      console.warn(`[WebRTC] Max reconnect attempts (${this._maxReconnectAttempts}) reached for ${deviceId}. Giving up UDP — falling back to TCP permanently.`);
+      this._initiatedConnections.delete(deviceId);
+      this._reconnectAttempts.delete(deviceId);
+      this.emit('udp_fallback', deviceId);
+      return;
+    }
+
+    // Exponential backoff: 2s, 4s, 8s, 16s, 32s
+    const delay = 2000 * Math.pow(2, attempts);
+    this._reconnectAttempts.set(deviceId, attempts + 1);
+
+    console.log(`[WebRTC] Scheduling reconnect to ${deviceId} in ${delay}ms (attempt ${attempts + 1}/${this._maxReconnectAttempts})`);
+
+    const timer = setTimeout(() => {
+      this._reconnectTimers.delete(deviceId);
+      // Only reconnect if the WebSocket signaling path is still available
+      if (typeof wsClient !== 'undefined' && wsClient.connected) {
+        console.log(`[WebRTC] Auto-reconnecting to ${deviceId}...`);
+        this.initConnection(deviceId).catch(err => {
+          console.error(`[WebRTC] Reconnect to ${deviceId} failed:`, err);
+        });
+      } else {
+        console.warn(`[WebRTC] Cannot reconnect to ${deviceId}: WebSocket not connected.`);
+      }
+    }, delay);
+
+    this._reconnectTimers.set(deviceId, timer);
+  }
+
+  /**
+   * [Sync v9.0] Reset reconnect counter for a device (called on successful connection).
+   */
+  _resetReconnectCounter(deviceId) {
+    this._reconnectAttempts.delete(deviceId);
   }
 }
 

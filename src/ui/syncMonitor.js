@@ -2,6 +2,7 @@
 // Real-time line chart showing per-device clock sync drift
 
 import { clockSync } from '../core/clockSync.js';
+import { audioPlayer } from '../core/audioPlayer.js';
 
 const MAX_POINTS = 150;  // 30 seconds at 200ms interval
 const TARGET_ZONE_MS = 5; // ±5ms target zone
@@ -143,6 +144,23 @@ export function renderSyncMonitor(canvas) {
       ctx.arc(lastX, lastY, 8, 0, Math.PI * 2);
       ctx.fillStyle = 'rgba(0, 229, 255, 0.2)';
       ctx.fill();
+
+      // [Sync v8.1] Telemetry Overlay
+      const apStats = audioPlayer.getStats();
+      const isConverged = clockSync.isConverged();
+      
+      ctx.textAlign = 'right';
+      ctx.font = 'bold 10px Inter, sans-serif';
+      
+      // Convergence Status
+      ctx.fillStyle = isConverged ? '#00e676' : '#ff9100';
+      ctx.fillText(`Sync: ${isConverged ? 'CONVERGED' : 'WAITING'}`, width - 10, padding.top + 10);
+      
+      // Error Stats
+      if (apStats.chunkDropCount > 0 || apStats.decodeErrorCount > 0) {
+        ctx.fillStyle = '#ff1744';
+        ctx.fillText(`Drops: ${apStats.chunkDropCount} | Errors: ${apStats.decodeErrorCount}`, width - 10, padding.top + 25);
+      }
     }
   }
 

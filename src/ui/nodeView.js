@@ -6,6 +6,7 @@ import { createNavbar } from './app.js';
 import { audioPlayer } from '../core/audioPlayer.js';
 import { clockSync } from '../core/clockSync.js';
 import { acousticSync } from '../core/acousticSync.js';
+import { platformLatency } from '../core/platformLatency.js';
 import { wsClient } from '../core/wsClient.js';
 import { initWaveformViz } from './waveformViz.js';
 import { getSyncColor, formatMs } from '../utils/helpers.js';
@@ -15,6 +16,28 @@ let statsInterval = null;
 
 export function renderNodeView() {
   const app = document.getElementById('app');
+
+  const showAlert = (id, title, message, type = 'warning') => {
+    const alertsContainer = document.getElementById('alerts-container');
+    if (!alertsContainer || document.getElementById(`alert-${id}`)) return;
+    const alert = document.createElement('div');
+    alert.id = `alert-${id}`;
+    alert.className = `glass-card alert alert--${type} page-enter`;
+    alert.style.marginBottom = '12px';
+    alert.style.padding = '12px 16px';
+    alert.style.borderLeft = `4px solid var(--${type === 'warning' ? 'warning' : 'accent-primary'})`;
+    alert.innerHTML = `
+      <div class="flex flex-between align-center">
+        <div>
+          <strong style="display: block; font-size: 0.9em; text-transform: uppercase; letter-spacing: 0.05em;">${title}</strong>
+          <span style="font-size: 0.85em; opacity: 0.8;">${message}</span>
+        </div>
+        <button class="btn btn-sm btn-icon alert-close" style="padding: 4px; opacity: 0.5;">✕</button>
+      </div>
+    `;
+    alert.querySelector('.alert-close').onclick = () => alert.remove();
+    alertsContainer.appendChild(alert);
+  };
 
   app.innerHTML = `
     ${createNavbar('node', appState.session)}
@@ -26,6 +49,8 @@ export function renderNodeView() {
           Connected to <strong class="text-accent">${appState.session?.roomName || 'Host'}</strong>
         </p>
       </div>
+
+      <div id="alerts-container" style="margin-bottom: 16px;"></div>
 
       <div class="page-content">
         <div class="node-layout">
@@ -143,35 +168,6 @@ export function renderNodeView() {
             </div>
           </div>
 
-          <!-- Output Routing -->
-          <div class="glass-card">
-            <div class="section-header">
-              <h3 class="section-title">🔌 Output Routing</h3>
-              <div class="flex gap-2">
-                <button class="btn btn-secondary btn-xs" id="btn-refresh-outputs">🔄 Sca</button>
-                <button class="btn btn-primary btn-xs hidden" id="btn-native-select">✨ Smart Select</button>
-              </div>
-            </div>
-            <p class="text-xs text-secondary" style="margin-bottom: 12px;">
-              Split your audio stream to multiple devices simultaneously.
-            </p>
-            
-            <div id="output-sinks-list" class="output-sinks-list">
-              <!-- Rendered via JS -->
-            </div>
-
-            <!-- Mobile Routing Note -->
-            <div class="info-box info-box--warning" style="margin-top: 16px;">
-              <div class="info-box-title">⚠️ Mobile Limitation</div>
-              <p class="text-xs">
-                Phones usually route <strong>all</strong> audio to one place. To play through <strong>both</strong> Phone + Bluetooth, 
-                connect the Bluetooth speaker to a <em>different</em> device and join this room!
-              </p>
-              <div class="info-box-action" id="samsung-tip" style="display: none; margin-top: 8px; padding-top: 8px; border-top: 1px border-subtle;">
-                <p class="text-xs"><strong>Galaxy User?</strong> Turn on <em>"Separate App Sound"</em> in Settings to force dual-routing.</p>
-              </div>
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -356,116 +352,6 @@ export function renderNodeView() {
       @keyframes fadeIn { to { opacity: 1; } }
       @keyframes slideUp { to { transform: translateY(0); opacity: 1; } }
 
-      /* Multi-Sink Styles */
-      .output-sinks-list {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-      }
-      .sink-item {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 10px 14px;
-        background: rgba(255, 255, 255, 0.05);
-        border-radius: var(--radius-sm);
-        transition: background 0.2s;
-      }
-      .sink-item:hover {
-        background: rgba(255, 255, 255, 0.08);
-      }
-      .sink-info {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-      }
-      .sink-label {
-        font-size: 14px;
-        font-weight: 500;
-        color: var(--text-primary);
-      }
-      .sink-id {
-        font-size: 10px;
-        color: var(--text-tertiary);
-        font-family: monospace;
-      }
-
-      /* Switch Component */
-      .switch {
-        position: relative;
-        display: inline-block;
-        width: 38px;
-        height: 20px;
-      }
-      .switch input {
-        opacity: 0;
-        width: 0;
-        height: 0;
-      }
-      .slider-switch {
-        position: absolute;
-        cursor: pointer;
-        top: 0; left: 0; right: 0; bottom: 0;
-        background-color: rgba(255,255,255,0.1);
-        transition: .4s;
-        border-radius: 20px;
-      }
-      .slider-switch:before {
-        position: absolute;
-        content: "";
-        height: 14px;
-        width: 14px;
-        left: 3px;
-        bottom: 3px;
-        background-color: white;
-        transition: .4s;
-        border-radius: 50%;
-      }
-      input:checked + .slider-switch {
-        background-color: var(--accent-primary);
-      }
-      input:checked + .slider-switch:before {
-        transform: translateX(18px);
-      }
-      .sink-nudge-container {
-        display: none;
-        margin-top: 10px;
-        padding-top: 6px;
-        border-top: 1px solid rgba(255, 255, 255, 0.05);
-        flex-direction: column;
-        gap: 4px;
-      }
-      .sink-item.enabled .sink-nudge-container {
-        display: flex;
-      }
-      .sink-nudge-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-      }
-      .sink-nudge-label {
-        font-size: 11px;
-        color: var(--text-tertiary);
-      }
-      .sink-nudge-value {
-        font-size: 11px;
-        font-weight: 700;
-        color: var(--accent-primary);
-      }
-      .sink-nudge-controls {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-      .loader-small {
-        width: 16px;
-        height: 16px;
-        border: 2px solid rgba(255,255,255,0.1);
-        border-top: 2px solid var(--accent-primary);
-        border-radius: 50%;
-        animation: spin 1s linear infinite;
-        margin: 0 auto 8px;
-      }
       @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
   `;
@@ -691,6 +577,22 @@ function bindNodeEvents() {
     if (btn) btn.textContent = `👂 Heard ${data.index + 1}/${data.total}`;
   });
 
+  // [Sync v9.6] Bluetooth Detection Listener
+  platformLatency.on('bluetooth_detected', () => {
+    showAlert('bluetooth', 'Bluetooth Detected', 'Audio delay increased by 150ms to compensate for wireless latency.', 'info');
+  });
+
+  // [Sync v9.6] Sample Rate Guard
+  const checkHardware = () => {
+    try {
+      const tempCtx = audioPlayer.audioContext || new (window.AudioContext || window.webkitAudioContext)();
+      if (tempCtx.sampleRate !== 48000) {
+        showAlert('sample-rate', 'Sample Rate Mismatch', `Hardware is ${tempCtx.sampleRate}Hz (Stream is 48000Hz). Expect potential drift.`, 'warning');
+      }
+    } catch (e) {}
+  };
+  setTimeout(checkHardware, 1000);
+
   acousticSync.on('calibration_complete', (data) => {
     // [Sync v5.3] Fail-Safe Check
     // Only apply the offset if we have a significant number of valid detections.
@@ -760,142 +662,6 @@ function bindNodeEvents() {
     }
   }, 3000);
 
-  // Multi-Sink Initial Render
-  renderOutputSinks();
-
-  // Platform detection for routing tips
-  const ua = navigator.userAgent.toLowerCase();
-  if (ua.includes('samsung') || ua.includes('galaxy')) {
-    document.getElementById('samsung-tip')?.style.setProperty('display', 'block');
-  }
-
-  // Show smart select if supported
-  if (navigator.mediaDevices && typeof navigator.mediaDevices.selectAudioOutput === 'function') {
-    document.getElementById('btn-native-select')?.classList.remove('hidden');
-  }
-
-  // Multi-Sink Events
-  document.getElementById('btn-native-select')?.addEventListener('click', async () => {
-    const deviceId = await audioPlayer.requestOutputSelection();
-    if (deviceId) {
-      renderOutputSinks();
-      showToast('Device selected via system prompt!', 'success');
-    }
-  });
-
-  document.getElementById('btn-refresh-outputs')?.addEventListener('click', async () => {
-    // Attempting to get user media often triggers the permission prompt 
-    // that allows us to see the labels of the devices.
-    try {
-      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        // Just a dummy request to get permission
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        stream.getTracks().forEach(t => t.stop());
-      }
-    } catch (e) {
-      console.warn('Microphone permission denied, device labels may be hidden');
-    }
-    renderOutputSinks();
-  });
-}
-
-/**
- * Fetch and render the list of available audio outputs
- */
-async function renderOutputSinks() {
-  const container = document.getElementById('output-sinks-list');
-  if (!container) return;
-
-  try {
-    const outputs = await audioPlayer.enumerateAvailableOutputs();
-    const enabledIds = audioPlayer.enabledSinkIds;
-
-    if (outputs.length === 0) {
-      container.innerHTML = '<p class="text-xs text-secondary text-center">No output devices found.</p>';
-      return;
-    }
-
-    container.innerHTML = outputs.map(sink => {
-      const isEnabled = enabledIds.has(sink.deviceId);
-      const delay = audioPlayer.getSinkDelay(sink.deviceId);
-      
-      return `
-        <div class="sink-item ${isEnabled ? 'enabled' : ''}" data-id="${sink.deviceId}">
-          <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
-            <div class="sink-info">
-              <span class="sink-label">${sink.label}</span>
-              <span class="sink-id">${sink.deviceId === 'default' ? 'system default' : sink.deviceId.slice(0, 8) + '...'}</span>
-            </div>
-            <label class="switch">
-              <input type="checkbox" class="sink-toggle" data-id="${sink.deviceId}" ${isEnabled ? 'checked' : ''}>
-              <span class="slider-switch"></span>
-            </label>
-          </div>
-          
-          <div class="sink-nudge-container">
-            <div class="sink-nudge-header">
-              <span class="sink-nudge-label">Sync Nudge (Local)</span>
-              <span class="sink-nudge-value" id="nudge-val-${sink.deviceId}">${delay > 0 ? '+' : ''}${delay}ms</span>
-            </div>
-            <div class="sink-nudge-controls">
-              <input type="range" class="range-slider sink-nudge-slider" 
-                data-id="${sink.deviceId}" min="-800" max="800" step="5" value="${delay}" 
-                style="flex: 1; height: 16px;">
-              <button class="btn btn-ghost btn-xs bt-preset" data-id="${sink.deviceId}" title="Apply BT Preset (+200ms)">🎧</button>
-            </div>
-          </div>
-        </div>
-      `;
-    }).join('');
-
-    // Bind toggles
-    container.querySelectorAll('.sink-toggle').forEach(toggle => {
-      toggle.addEventListener('change', async (e) => {
-        const id = e.target.getAttribute('data-id');
-        const enabled = e.target.checked;
-        const item = container.querySelector(`.sink-item[data-id="${id}"]`);
-        
-        try {
-          await audioPlayer.setSinkEnabled(id, enabled);
-          if (enabled) {
-            item?.classList.add('enabled');
-            showToast(`Output enabled: ${id === 'default' ? 'Default' : 'External'}`, 'success');
-          } else {
-            item?.classList.remove('enabled');
-          }
-        } catch (err) {
-          showToast('Failed to toggle output: ' + err.message, 'error');
-          e.target.checked = !enabled; // Rollback
-        }
-      });
-    });
-
-    // Bind sliders
-    container.querySelectorAll('.sink-nudge-slider').forEach(slider => {
-      slider.addEventListener('input', (e) => {
-        const id = e.target.getAttribute('data-id');
-        const ms = parseInt(e.target.value);
-        audioPlayer.setSinkDelay(id, ms);
-        const display = document.getElementById(`nudge-val-${id}`);
-        if (display) display.textContent = (ms > 0 ? '+' : '') + ms + 'ms';
-      });
-    });
-
-    // Bind presets
-    container.querySelectorAll('.bt-preset').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const id = btn.getAttribute('data-id');
-        const slider = container.querySelector(`.sink-nudge-slider[data-id="${id}"]`);
-        if (slider) {
-          slider.value = 200;
-          slider.dispatchEvent(new Event('input'));
-          showToast('Bluetooth preset applied (+200ms)', 'info');
-        }
-      });
-    });
-  } catch (err) {
-    container.innerHTML = `<p class="text-xs text-error text-center">Error: ${err.message}</p>`;
-  }
 }
 
 function startStatsUpdater() {

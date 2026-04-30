@@ -146,7 +146,7 @@ class WSClient extends EventEmitter {
       this.ws.send(buffer);
       return true;
     } catch (e) {
-      // Don't spam binary errors as they can happen frequently during jitter
+      if (Math.random() < 0.01) console.error('[WSClient] Binary send failed:', e);
       return false;
     }
   }

@@ -46,15 +46,19 @@ class PlaybackWorklet extends AudioWorkletProcessor {
           this.buffer.shift();
         }
       } else if (type === 'sync_update') {
-        this.globalOffset = payload.offset;
-        this.globalSkew = payload.skew;
+        this.globalOffset = payload.globalOffset !== undefined ? payload.globalOffset : payload.offset;
+        this.globalSkew = payload.globalSkew !== undefined ? payload.globalSkew : payload.skew;
         this.lastSyncTime = payload.lastSyncTime;
         this.timeOrigin = payload.timeOrigin;
         
         // [Sync v6.2] High-Precision Clock Alignment
-        // We capture the relationship between real system time and audio context time
         this.performanceNow = payload.performanceNow;
         this.audioContextTime = payload.audioContextTime;
+        
+        // [Sync v7.5] Anchor-Based Synchronization
+        this.anchorContextTime = payload.anchorContextTime;
+        this.anchorSharedTime = payload.anchorSharedTime;
+        this.playbackRate = payload.playbackRate || this.playbackRate;
       } else if (type === 'set_rate') {
         this.playbackRate = payload;
       } else if (type === 'set_mask') {
@@ -112,7 +116,7 @@ class PlaybackWorklet extends AudioWorkletProcessor {
         // 1. Smoothly interpolate playback rate with proper anti-aliasing [Sync v6.7]
         // Use low-pass filter (τ = 5ms, ~32Hz cutoff) to prevent pitch artifacts
         // Formula: y += (target - y) * (1 - exp(-t/τ))
-        const tau = 0.005; // 5ms time constant in seconds
+        const tau = 0.020; // [Sync v7.1] 20ms time constant (up from 5ms) for ultra-smooth pitch
         const dt = 1 / sampleRate;
         const alpha = 1 - Math.exp((-2 * Math.PI * dt) / tau);
         this.actualRate = this.actualRate + (this.playbackRate - this.actualRate) * alpha;
@@ -122,18 +126,23 @@ class PlaybackWorklet extends AudioWorkletProcessor {
           const sampleContextTime = currentTime + (i / sampleRate);
           const next = this.buffer[0];
           
-          // [Sync v7.0] Precision Pickup: only start if it's actually time to play
-          if (sampleContextTime >= next.playAtContextTime) {
+          const timeUntilPlay = next.playAtContextTime - sampleContextTime;
+          
+          // [Sync v8.3] Gapless Pickup: allow up to 20ms early start to prevent silence gaps
+          // and compensate for message passing delay from the main thread.
+          if (timeUntilPlay <= 0.020) {
             this.currentChunk = this.buffer.shift();
             
-            // If we are slightly late, skip samples to maintain sync
-            const lateSeconds = sampleContextTime - next.playAtContextTime;
-            this.readOffset = Math.floor(lateSeconds * sampleRate);
-            
-            // If we are so late that the whole chunk is gone, drop it
-            if (this.readOffset >= this.currentChunk.data.length / 2) {
-              this.currentChunk = null;
-              this.readOffset = 0;
+            // Only skip samples if we are severely late (> 10ms).
+            // Otherwise, preserve the sub-sample fractional readOffset for phase continuity!
+            if (timeUntilPlay < -0.010) {
+              this.readOffset = Math.floor(-timeUntilPlay * sampleRate);
+              
+              // If we are so late that the whole chunk is gone, drop it
+              if (this.readOffset >= this.currentChunk.data.length / 2) {
+                this.currentChunk = null;
+                this.readOffset = 0;
+              }
             }
           }
         }

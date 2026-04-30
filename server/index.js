@@ -9,7 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { SessionManager } from './sessionManager.js';
-import { ClockSyncMaster } from './clockSync.js';
+import { syncMaster } from './syncMasterV2.js';
 import { AudioRelay } from './audioRelay.js';
 import { DeviceRegistry } from './deviceRegistry.js';
 import { youtubeHandler } from './youtubeHandler.js';
@@ -156,7 +156,6 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 // Core systems
 const deviceRegistry = new DeviceRegistry();
 const sessionManager = new SessionManager(deviceRegistry);
-const clockSync = new ClockSyncMaster();
 const audioRelay = new AudioRelay();
 let lastGlobalBufferBroadcast = 0;
 
@@ -170,6 +169,7 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data, isBinary) => {
     if (isBinary) {
       // Binary = audio data from Host
+      console.log(`[SoundMesh] Binary chunk received from ${ws.deviceId} (${data.length} bytes)`);
       audioRelay.relay(data, ws, wss, deviceRegistry);
     } else {
       // JSON = control messages
@@ -281,7 +281,21 @@ function handleMessage(ws, deviceId, msg) {
   switch (msg.type) {
     // ── Clock Sync ──
     case 'sync_ping': {
-      const response = clockSync.handlePing(deviceId, msg.payload);
+      // Register device if not already registered
+      const device = syncMaster.getDeviceInfo(deviceId);
+      if (!device || device.syncStatus === 'initializing') {
+        const platformInfo = msg.payload.platformInfo || {};
+        syncMaster.registerDevice(deviceId, platformInfo);
+      }
+
+      // Handle sync and get response
+      const response = syncMaster.handleSync(deviceId, msg.payload);
+      
+      // Add convergence status for diagnostics
+      if (response) {
+        response.convergenceStatus = syncMaster.getConvergenceStatus();
+      }
+
       sendJSON(ws, { type: 'sync_pong', payload: response });
       break;
     }
@@ -324,9 +338,16 @@ function handleMessage(ws, deviceId, msg) {
     // ── Playback State ──
     case 'playback_state': {
       sessionManager.updatePlaybackState(msg.payload);
+      // [Sync v8.1] Coordinated Playback Start with Time Anchor
+      // Provide a 1000ms lead-time so all nodes can converge clock sync
+      // before audio chunks start arriving
+      const playbackServerTime = syncMaster.getServerTime();
       broadcastJSON({
         type: 'playback_state_changed',
-        payload: msg.payload,
+        payload: {
+          ...msg.payload,
+          applyAtServerTime: playbackServerTime + 1000 // All devices apply at this absolute server time
+        },
       }, ws);
       break;
     }
@@ -337,26 +358,46 @@ function handleMessage(ws, deviceId, msg) {
         outputLatency: msg.payload.outputLatency,
         btLatency: msg.payload.btLatency,
       });
-      // Recalculate global buffer
-      const globalBuffer = clockSync.recalculateGlobalBuffer(deviceRegistry.getAllDevices());
-      broadcastJSON({
-        type: 'global_buffer_update',
-        payload: { globalBuffer },
+
+      // Update syncMaster with new latencies
+      syncMaster.updateDeviceLatencies(deviceId, {
+        outputLatency: msg.payload.outputLatency,
+        btLatency: msg.payload.btLatency,
       });
+
+      // [Sync v8.1] Throttle global buffer updates to avoid UI/Network congestion
+      // Latency reports are now periodic heartbeats
+      const now = Date.now();
+      if (now - lastGlobalBufferBroadcast > 3000) {
+        lastGlobalBufferBroadcast = now;
+        const globalBuffer = syncMaster.calculateGlobalBuffer();
+        const serverNow = syncMaster.getServerTime();
+        broadcastJSON({
+          type: 'global_buffer_update',
+          payload: { 
+            globalBuffer,
+            applyAtServerTime: serverNow + 2000 // 2s lead-time for all devices to apply
+          },
+        });
+      }
       break;
     }
 
     case 'underrun_report': {
-      clockSync.reportUnderrun();
+      syncMaster.reportUnderrun(deviceId);
       
-      // [Sync v6.6] Throttle global buffer updates to avoid UI thread congestion
+      // [Sync v8.1] Throttle global buffer updates on underrun
       const now = Date.now();
       if (now - lastGlobalBufferBroadcast > 3000) {
         lastGlobalBufferBroadcast = now;
-        const globalBuffer = clockSync.recalculateGlobalBuffer(deviceRegistry.getAllDevices());
+        const globalBuffer = syncMaster.calculateGlobalBuffer();
+        const serverNow = syncMaster.getServerTime();
         broadcastJSON({
           type: 'global_buffer_update',
-          payload: { globalBuffer },
+          payload: { 
+            globalBuffer,
+            applyAtServerTime: serverNow + 2000 // 2s lead-time for all devices to apply
+          },
         });
       }
       break;

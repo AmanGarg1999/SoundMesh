@@ -5,6 +5,8 @@ import { audioCapture } from './core/audioCapture.js';
 import { audioStreamer } from './core/audioStreamer.js';
 import { audioPlayer } from './core/audioPlayer.js';
 import { acousticSync } from './core/acousticSync.js';
+import { platformLatency } from './core/platformLatency.js';
+import { bluetoothSyncManager } from './core/bluetoothSync.js';
 import { SURROUND_POSITIONS } from './utils/constants.js';
 import { initMeshBackground } from './ui/app.js';
 import { renderLanding } from './ui/landing.js';
@@ -40,6 +42,22 @@ function init() {
 
     // Start clock sync
     clockSync.start();
+
+    // [Sync v8.1] Start platform latency calibration
+    platformLatency.calibrateAcoustic().catch(err => 
+      console.warn('[App] Platform calibration skipped:', err.message)
+    );
+
+    // [Sync v8.1] Initialize Bluetooth sync if on node
+    let bluetoothSync = null;
+    if (appState.role === 'node') {
+      bluetoothSync = bluetoothSyncManager(audioPlayer);
+      bluetoothSync.discoverBTDevices().then(devices => {
+        if (devices.length > 0) {
+          console.log(`[App] Discovered ${devices.length} BT audio devices`);
+        }
+      }).catch(err => console.warn('[App] BT discovery failed:', err));
+    }
 
     // Render appropriate view
     if (appState.role === 'host') {
@@ -124,10 +142,29 @@ function init() {
     console.log('[DEBUG] playback_state_changed:', payload);
     if (appState.role === 'node') {
       if (payload.isPlaying) {
-        console.log('[App] Host started streaming - STARTING AUDIO PLAYER');
+        console.log('[App] Host started streaming. Waiting for sync convergence...');
+        
+        // [Sync v8.0] Convergence Check
+        // Ensure we have a stable clock offset before initializing the audio engine.
+        // This prevents the "starting with wrong calibration" bug.
+        // [Sync v8.1] Strict Convergence Check
+        // We wait until the clock has actually converged (not just a timeout).
+        // This prevents starting audio with an unstable or unknown offset.
+        if (!clockSync.isConverged()) {
+          console.log('[App] Waiting for clock convergence...');
+          for (let i = 0; i < 50; i++) { // Wait up to 5 seconds
+            await new Promise(r => setTimeout(r, 100));
+            if (clockSync.isConverged()) break;
+          }
+          
+          if (!clockSync.isConverged()) {
+            console.warn('[App] Warning: Starting audio with unconverged clock after 5s timeout.');
+          }
+        }
+
         appState.isAudioActive = true;
         try {
-          await audioPlayer.start();
+          await audioPlayer.start(payload.applyAt);
           console.log('[App] audioPlayer.start() COMPLETED SUCCESSFULLY');
           showToast('🎵 Audio streaming started', 'success');
         } catch (err) {
