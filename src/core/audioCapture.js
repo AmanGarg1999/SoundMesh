@@ -62,7 +62,9 @@ class AudioCapture extends EventEmitter {
       // On macOS/Chrome, system audio is only available when sharing "Entire Screen"
       this.mediaStream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
-        audio: true
+        audio: {
+          suppressLocalAudioPlayback: true
+        }
       });
 
       // Ensure AudioContext is running (required after user gesture)
@@ -102,6 +104,12 @@ class AudioCapture extends EventEmitter {
       console.log('[AudioCapture] System audio capture started');
       this.emit('capture_started', { source: 'system' });
       insomnia.activate();
+
+      // [Sync v9.7] Auto-start synced player for host (same as file playback)
+      // This ensures the host hears audio through the delayed SoundMesh pipeline
+      if (!audioPlayer.isPlaying) {
+        audioPlayer.start().catch(e => console.warn('[AudioCapture] Failed to auto-start host player:', e));
+      }
 
     } catch (err) {
       console.error('[AudioCapture] Failed to capture system audio:', err);

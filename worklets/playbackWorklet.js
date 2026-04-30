@@ -117,19 +117,17 @@ class PlaybackWorklet extends AudioWorkletProcessor {
 
       // [Sync v8.0] Active Drift Compensation
       // We scale the elapsed context time by our calculated playback rate.
-      const blockSharedTime = this.smoothedAnchorSharedTime + (elapsedContextS * 1000 * this.actualRate);
+      let currentSampleSharedTime = this.smoothedAnchorSharedTime + (elapsedContextS * 1000 * this.actualRate);
 
       for (let i = 0; i < frameCount; i++) {
           // 1. Smoothly interpolate playback rate (Exp-Lerp)
           this.actualRate = (this.actualRate * 0.999) + (this.playbackRate * 0.001);
 
-          const sampleSharedTime = blockSharedTime + (i * msPerSample * this.actualRate);
-
           // 2. Sample Alignment Logic
-          // We find the chunk that contains the current sampleSharedTime
+          // We find the chunk that contains the currentSampleSharedTime
           while (this.buffer.length > 0) {
               const chunk = this.buffer[0];
-              const sampleOffset = (sampleSharedTime - chunk.targetPlayTime) / msPerSample;
+              const sampleOffset = (currentSampleSharedTime - chunk.targetPlayTime) / msPerSample;
 
               if (sampleOffset < 0) {
                   // This sample is in the future relative to the next chunk.
@@ -173,15 +171,14 @@ class PlaybackWorklet extends AudioWorkletProcessor {
                 left[i] = 0;
                 right[i] = 0;
               }
-
-              // In Phase-Locked mode, we don't increment readOffset manually.
-              // It's recalculated every iteration based on the shared clock.
-              // this.readOffset += this.actualRate;
           } else {
               // Starvation/Waiting
               left[i] = 0;
               right[i] = 0;
           }
+
+          // [Sync v9.8] Cumulative time progression for smoother interpolation
+          currentSampleSharedTime += msPerSample * this.actualRate;
       }
     } catch (err) {
       // Prevent entire audio thread from crashing on single error

@@ -73,6 +73,9 @@ class AudioPlayer extends EventEmitter {
     this.isScheduling = false; // [Sync v7.0] Scheduling Lock
     this.chunkDropCount = 0;
     this.decodeErrorCount = 0;
+    this.playbackRate = 1.0; // [Sync v9.8] Track active rate for Worklet sync
+    this.schedulerWorkerBlobUrl = null;
+
 
     // [Sync v8.1] Early Listener Registration
     // We register listeners in the constructor so that chunks are buffered
@@ -184,8 +187,6 @@ class AudioPlayer extends EventEmitter {
         sampleRate: SAMPLE_RATE,
       });
       
-      console.log(`[AudioPlayer] AudioContext created. State: ${this.audioContext.state}, Latency: ${(this.audioContext.outputLatency*1000).toFixed(1)}ms`);
-
       console.log(`[AudioPlayer] AudioContext created. State: ${this.audioContext.state}, Latency: ${(this.audioContext.outputLatency*1000).toFixed(1)}ms`);
 
       this.audioContext.onstatechange = () => console.log('[AudioPlayer] Native state:', this.audioContext.state);
@@ -347,13 +348,6 @@ class AudioPlayer extends EventEmitter {
     }
   }
 
-  setVolume(value) {
-    this.volume = Math.max(0, Math.min(1, value));
-    if (this.gainNode && this.audioContext) {
-      // Ramp smoothly to avoid clicking "zipper" noise
-      this.gainNode.gain.setTargetAtTime(this.volume, this.audioContext.currentTime, 0.05);
-    }
-  }
 
   /**
    * Update device spatial state and channel mapping
@@ -493,7 +487,9 @@ class AudioPlayer extends EventEmitter {
           };
         `;
         const blob = new Blob([workerCode], { type: 'application/javascript' });
-        this.schedulerWorker = new Worker(URL.createObjectURL(blob));
+        if (this.schedulerWorkerBlobUrl) URL.revokeObjectURL(this.schedulerWorkerBlobUrl);
+        this.schedulerWorkerBlobUrl = URL.createObjectURL(blob);
+        this.schedulerWorker = new Worker(this.schedulerWorkerBlobUrl);
         this.schedulerWorker.onmessage = () => {
           if (this.isPlaying) {
             this.lastSchedulerTick = Date.now();
@@ -1022,12 +1018,14 @@ class AudioPlayer extends EventEmitter {
         rate = Math.max(1.0 - limit, Math.min(1.0 + limit, isNaN(rate) ? 1.0 : rate));
 
         // [Sync v6.0] Update Worklet Playback Rate
+        this.playbackRate = rate;
         if (this.workletNode) {
           this.workletNode.port.postMessage({ type: 'set_rate', payload: rate });
         }
       } else {
         // If within deadzone, slowly decay the integral term to avoid oscillation
         this.driftIntegral *= 0.99;
+        this.playbackRate = 1.0;
         if (this.workletNode) {
           this.workletNode.port.postMessage({ type: 'set_rate', payload: 1.0 });
         }
@@ -1302,7 +1300,7 @@ class AudioPlayer extends EventEmitter {
       payload: {
         anchorContextTime,
         anchorSharedTime,
-        playbackRate: this.playbackRate || 1.0,
+        playbackRate: this.playbackRate, // [Sync v9.8] Correctly pass tracked rate
         globalOffset: clockSync.offset,
         globalSkew: clockSync.skew,
         lastSyncTime: clockSync.lastSyncTime,

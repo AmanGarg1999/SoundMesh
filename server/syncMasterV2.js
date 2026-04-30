@@ -59,13 +59,15 @@ export class SyncMasterV2 {
     // Use client-reported offset. The server CANNOT calculate offset accurately
     // without clientReceiveTime, so we rely entirely on the client's calculation.
     if (lastOffset !== undefined) {
-      // Maintain rolling average of last 32 samples
+      // Maintain rolling history of last 32 samples
       device.offsetHistory.push(lastOffset);
       if (device.offsetHistory.length > 32) {
         device.offsetHistory.shift();
       }
 
-      device.offset = device.offsetHistory.reduce((a, b) => a + b, 0) / device.offsetHistory.length;
+      // [Sync v9.8] Median Filter for Offset tracking
+      const sorted = [...device.offsetHistory].sort((a, b) => a - b);
+      device.offset = sorted[Math.floor(sorted.length / 2)];
     }
     device.lastSyncTime = serverTime;
 

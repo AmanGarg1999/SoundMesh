@@ -260,6 +260,7 @@ wss.on('connection', (ws, req) => {
     if (currentDeviceId) {
       console.log(`[SoundMesh] Device disconnected: ${currentDeviceId}`);
       deviceRegistry.unregister(currentDeviceId);
+      syncMaster.unregisterDevice(currentDeviceId); // [Sync v9.8] Prevent state leak
       broadcastJSON({
         type: 'device_left',
         payload: { deviceId: currentDeviceId },
