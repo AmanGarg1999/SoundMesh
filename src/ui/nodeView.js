@@ -14,30 +14,30 @@ import { getSyncColor, formatMs } from '../utils/helpers.js';
 let waveformCleanup = null;
 let statsInterval = null;
 
+export function showAlert(id, title, message, type = 'warning') {
+  const alertsContainer = document.getElementById('alerts-container');
+  if (!alertsContainer || document.getElementById(`alert-${id}`)) return;
+  const alert = document.createElement('div');
+  alert.id = `alert-${id}`;
+  alert.className = `glass-card alert alert--${type} page-enter`;
+  alert.style.marginBottom = '12px';
+  alert.style.padding = '12px 16px';
+  alert.style.borderLeft = `4px solid var(--${type === 'warning' ? 'warning' : 'accent-primary'})`;
+  alert.innerHTML = `
+    <div class="flex flex-between align-center">
+      <div>
+        <strong style="display: block; font-size: 0.9em; text-transform: uppercase; letter-spacing: 0.05em;">${title}</strong>
+        <span style="font-size: 0.85em; opacity: 0.8;">${message}</span>
+      </div>
+      <button class="btn btn-sm btn-icon alert-close" style="padding: 4px; opacity: 0.5;">✕</button>
+    </div>
+  `;
+  alert.querySelector('.alert-close').onclick = () => alert.remove();
+  alertsContainer.appendChild(alert);
+}
+
 export function renderNodeView() {
   const app = document.getElementById('app');
-
-  const showAlert = (id, title, message, type = 'warning') => {
-    const alertsContainer = document.getElementById('alerts-container');
-    if (!alertsContainer || document.getElementById(`alert-${id}`)) return;
-    const alert = document.createElement('div');
-    alert.id = `alert-${id}`;
-    alert.className = `glass-card alert alert--${type} page-enter`;
-    alert.style.marginBottom = '12px';
-    alert.style.padding = '12px 16px';
-    alert.style.borderLeft = `4px solid var(--${type === 'warning' ? 'warning' : 'accent-primary'})`;
-    alert.innerHTML = `
-      <div class="flex flex-between align-center">
-        <div>
-          <strong style="display: block; font-size: 0.9em; text-transform: uppercase; letter-spacing: 0.05em;">${title}</strong>
-          <span style="font-size: 0.85em; opacity: 0.8;">${message}</span>
-        </div>
-        <button class="btn btn-sm btn-icon alert-close" style="padding: 4px; opacity: 0.5;">✕</button>
-      </div>
-    `;
-    alert.querySelector('.alert-close').onclick = () => alert.remove();
-    alertsContainer.appendChild(alert);
-  };
 
   app.innerHTML = `
     ${createNavbar('node', appState.session)}
@@ -164,6 +164,10 @@ export function renderNodeView() {
               <div class="stat-item">
                 <span class="stat-value" id="stat-rtt">--</span>
                 <span class="stat-label">RTT (ms)</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-value" id="stat-confidence">--</span>
+                <span class="stat-label">AuraSync Confidence</span>
               </div>
             </div>
           </div>
@@ -730,5 +734,13 @@ function startStatsUpdater() {
     if (statBuffer) statBuffer.textContent = playerStats.bufferDepth;
     if (statLatency) statLatency.textContent = playerStats.outputLatency.toFixed(1);
     if (statRtt) statRtt.textContent = syncStats.avgRtt > 0 ? syncStats.avgRtt.toFixed(1) : '--';
+
+    const statConfidence = document.getElementById('stat-confidence');
+    if (statConfidence) {
+      const confidence = platformLatency.calibrationConfidence || 0;
+      statConfidence.textContent = `${(confidence * 100).toFixed(0)}%`;
+      statConfidence.style.color = confidence > 0.8 ? 'var(--status-synced)' : 
+                                   confidence > 0.5 ? 'var(--status-drifting)' : 'var(--status-error)';
+    }
   }, 200);
 }

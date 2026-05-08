@@ -98,6 +98,7 @@ export class DeviceRegistry {
       isLocalhost: info.isLocalhost,
       userAgent: info.userAgent,
       platform: this.detectPlatform(info.userAgent),
+      capabilities: info.capabilities || { supportsOpus: false, supportsWebRTC: true },
       outputMode: 'builtin', 
       volume: 1.0,
       muted: false,

@@ -7,6 +7,8 @@ export const BITS_PER_SAMPLE = 16;
 export const CHUNK_DURATION_MS = 20; // 20ms per chunk (Optimal for VoIP/MTU)
 export const SAMPLES_PER_CHUNK = (SAMPLE_RATE * CHUNK_DURATION_MS) / 1000; // 240
 export const BYTES_PER_SAMPLE = BITS_PER_SAMPLE / 8;
+export const OPUS_BITRATE = 64000;
+export const OPUS_FRAME_DURATION = 20; // ms
 
 // Audio chunk binary header layout (16 bytes total)
 export const HEADER_SIZE = 16;
@@ -24,25 +26,25 @@ export const SYNC_OK_THRESHOLD = 1.5;      // ms — in sync (tightened for phas
 export const SYNC_DRIFT_THRESHOLD = 10;    // ms — drifting
 export const DEFAULT_GLOBAL_BUFFER = 150;  // ms (Increased from 100 for better jitter resilience)
 
-// PI Controller for phase locking [Sync v6.9 - Ultra-Smooth]
-export const PI_KP = 0.002;                // REDUCED from 0.005 → 2.5x smoother (eliminates pitch warble)
-export const PI_KI = 0.00005;              // REDUCED from 0.0001 → 2x less aggressive
-export const PI_INTEGRAL_MAX = 0.002;      // REDUCED from 0.005 → 2.5x lower ceiling
+// PI Controller for phase locking [Sync v9.7 - Faster Recovery]
+export const PI_KP = 0.008;                // INCREASED from 0.002 → 4x faster correction
+export const PI_KI = 0.0002;               // INCREASED from 0.00005 → 4x more persistent
+export const PI_INTEGRAL_MAX = 0.01;       // INCREASED from 0.002 → Higher ceiling for sustained drift
 
 // Jitter buffer
 export const JITTER_MIN_MS = 20;
 export const JITTER_MAX_MS = 1000;         // INCREASED from 300 to handle high BT + Global Buffer
 export const JITTER_INITIAL_MS = 150;
-export const JITTER_EXPAND_THRESHOLD = 10; // ms variance to trigger expansion
-export const PLAYBACK_RATE_ADJUST = 0.005; // ±0.5% rate adjustment (strictly enforced for audio quality)
+export const JITTER_EXPAND_THRESHOLD = 15; // ms variance to trigger expansion (Relaxed)
+export const PLAYBACK_RATE_ADJUST = 0.015; // ±1.5% rate adjustment (v9.7: increased for faster recovery)
 
 // Latency Reporting
 export const LATENCY_REPORT_INTERVAL_MS = 5000; // 5s interval for dynamic latency tracking
 
 // Unified Stale Threshold (Cross-platform sync)
 // All devices use the same threshold regardless of OS to maintain sync
-export const UNIFIED_STALE_THRESHOLD_MS = -120; // ms (chunks older than this are dropped)
-export const UNIFIED_FUTURE_THRESHOLD_MS = 300; // ms (chunks too far in future are skipped)
+export const UNIFIED_STALE_THRESHOLD_MS = -200; // ms (v9.7: Relaxed from -120 for high-latency nodes)
+export const UNIFIED_FUTURE_THRESHOLD_MS = 500; // ms (v9.7: Relaxed from 300)
 
 // Platform-specific overrides (deprecated, keeping for compatibility)
 export const PLATFORM_STALE_THRESHOLDS = {

@@ -94,7 +94,24 @@ export class SyncMasterV2 {
       convergenceProgress: device.convergenceProgress,
       readyToPlay: this.allDevicesConverged(),
       recommendedGlobalBuffer: this.calculateGlobalBuffer(),
+      deviceBuffer: this.calculateDeviceBuffer(deviceId), // [Sync v10] Per-device buffer
     };
+  }
+
+  /**
+   * Calculate a specific buffer for a device based on its own latency.
+   * This allows wired devices to play with lower latency than BT devices.
+   */
+  calculateDeviceBuffer(deviceId) {
+    const device = this.devices.get(deviceId);
+    if (!device) return this.globalBuffer;
+
+    const totalLatency = (device.outputLatency || 0) + (device.btLatency || 0);
+    const platformVariance = (device.platform?.os === 'android') ? 20 : 10;
+    
+    // Per-device buffer = their latency + variance + safety margin
+    // But we floor it at the globalBuffer (which is the session's minimum latency)
+    return Math.max(this.globalBuffer, Math.ceil(totalLatency + platformVariance + this.safetyMargin));
   }
 
   /**
@@ -137,8 +154,9 @@ export class SyncMasterV2 {
       platformVariance = 10;
     }
 
-    // Periodic safety decay: every 60s of stability, reduce margin by 5ms (min 30ms)
-    if (Date.now() - this.lastDecayTime > 60000) {
+    // [Sync v10] Periodic safety decay: every 120s of stability, reduce margin by 5ms (min 30ms)
+    // Slowed down from 60s to prevent 'buffer-flapping' in unstable environments.
+    if (Date.now() - this.lastDecayTime > 120000) {
       this.safetyMargin = Math.max(30, this.safetyMargin - 5);
       this.lastDecayTime = Date.now();
       console.log(`[SyncMasterV2] Stability detected. Reduced safety margin to ${this.safetyMargin}ms`);
@@ -155,10 +173,11 @@ export class SyncMasterV2 {
     const now = Date.now();
     const lastReport = this.lastUnderrunPerDevice.get(deviceId) || 0;
 
-    // Throttle: only increase margin once per 5 seconds per device
+    // [Sync v10] Throttle: only increase margin once per 5 seconds per device
+    // Increased cap to 300ms and step to 40ms for faster adaptation to bad WiFi/BT.
     if (now - lastReport > 5000) {
       this.lastUnderrunPerDevice.set(deviceId, now);
-      this.safetyMargin = Math.min(120, this.safetyMargin + 20);
+      this.safetyMargin = Math.min(300, this.safetyMargin + 40);
       this.lastDecayTime = now;
       console.log(`[SyncMasterV2] Underrun from ${deviceId}. Safety margin increased to ${this.safetyMargin}ms`);
       this.calculateGlobalBuffer();

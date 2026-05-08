@@ -23,6 +23,7 @@ import {
   UNIFIED_FUTURE_THRESHOLD_MS,
 } from '../utils/constants.js';
 import { insomnia } from '../utils/insomnia.js';
+import { FEC } from './fec.js';
 
 class AudioPlayer extends EventEmitter {
   constructor() {
@@ -39,6 +40,7 @@ class AudioPlayer extends EventEmitter {
     this.nextScheduledTime = 0;
     this.outputLatency = 0.04; // 40ms default
     this.localDelayOffset = 0; // Dynamic fallback buffer for slow networks
+    this.deviceBuffer = 0; // [Sync v10] Individual buffer from server
     this.schedulerInterval = null;
     this.chunksPlayed = 0;
     this.lastScheduledSeq = -1;
@@ -73,7 +75,8 @@ class AudioPlayer extends EventEmitter {
     this.isScheduling = false; // [Sync v7.0] Scheduling Lock
     this.chunkDropCount = 0;
     this.decodeErrorCount = 0;
-    this.playbackRate = 1.0; // [Sync v9.8] Track active rate for Worklet sync
+    this.playbackRate = 1.0; 
+    this.fec = new FEC(4); // [Sync v10.1] Dedicated receiver instance
     this.schedulerWorkerBlobUrl = null;
 
 
@@ -156,6 +159,17 @@ class AudioPlayer extends EventEmitter {
             }
           }, 500);
         }
+      }
+    });
+
+    // [Sync v10] Phase 5: Per-Device Adaptive Buffering
+    // Listen for individual buffer targets from the server
+    clockSync.on('sync_update', (data) => {
+      if (data.deviceBuffer !== undefined && data.deviceBuffer !== this.deviceBuffer) {
+        if (Math.abs(data.deviceBuffer - this.deviceBuffer) > 10) {
+          console.log(`[AudioPlayer] Updated deviceBuffer: ${this.deviceBuffer}ms -> ${data.deviceBuffer}ms`);
+        }
+        this.deviceBuffer = data.deviceBuffer;
       }
     });
   }
@@ -421,10 +435,10 @@ class AudioPlayer extends EventEmitter {
     if (this.audioContext.baseLatency) measuredLatency += this.audioContext.baseLatency;
     this.outputLatency = Math.max(measuredLatency, platformEst);
 
-    // [Sync v9.6] Convergence Gate
-    // Don't start playback until the clock is stable (max 5s wait)
+    // [Sync v9.7] Convergence Gate
+    // Don't start playback until the clock is stable (max 10s wait)
     console.log('[AudioPlayer] Waiting for clock convergence...');
-    await clockSync.waitForConvergence(5000);
+    await clockSync.waitForConvergence(10000);
 
     if (this.audioContext.state === 'suspended') {
       await this.audioContext.resume();
@@ -672,6 +686,7 @@ class AudioPlayer extends EventEmitter {
       if (this.jitterBuffer.seenSeqs.has(seq)) {
         return; 
       }
+      this.jitterBuffer.seenSeqs.set(seq, performance.now()); // [Sync v10] Mark as seen immediately to prevent Mesh loops
       
       if (seq % 50 === 0) {
         // [Sync v6.6] Diagnostic: If we receive a chunk while not connected, it's a loopback
@@ -682,6 +697,37 @@ class AudioPlayer extends EventEmitter {
       const targetPlayTime = view.getFloat64(4, true);
       const channelMask = view.getUint16(12, true);
       const flags = view.getUint16(14, true);
+
+      // [Sync v10.1] Phase 2: Forward Error Correction
+      const isParity = (flags & 0x04) !== 0;
+      const reconstructed = this.fec.decode(seq, arrayBuffer, isParity);
+      
+      if (reconstructed) {
+        if (seq % 100 === 0) console.log(`[AudioPlayer] FEC SUCCESS: Reconstructed missing packet #${reconstructed.seq}`);
+        // Handle reconstructed packet recursively
+        // Need to wrap in a separate microtask to avoid recursive try-catch issues
+        setTimeout(() => this.receiveChunk(reconstructed.data), 0);
+      }
+
+      if (isParity) return; // Parity packet's job is done
+      
+      // [Sync v10.1] Phase 6: P2P Mesh Relay
+      // IMPORTANT: Host nodes should NOT relay packets. They are the source.
+      // If a host relays a packet it receives (which might be a loopback), 
+      // it creates a broadcast storm that can crash the browser.
+      const isHost = wsClient.role === 'host';
+      const ttl = flags >> 8;
+      
+      if (ttl > 1 && !isHost) {
+        // Create a copy to mutate and relay
+        const relayBuffer = arrayBuffer.slice(0);
+        const relayView = new DataView(relayBuffer);
+        const newFlags = (flags & 0x00FF) | ((ttl - 1) << 8);
+        relayView.setUint16(14, newFlags, true);
+        
+        // Re-broadcast to neighbors via WebRTC (UDP)
+        webrtcManager.broadcast(relayBuffer);
+      }
 
       const isOpus = (flags & 0x02) !== 0;
 
@@ -887,57 +933,74 @@ class AudioPlayer extends EventEmitter {
 
       this.jitterBuffer.pop();
 
-      // [Sync v9.2] Stale-Drop Deadlock Recovery with Force-Play
-      // If _forceNextChunkPlay is set (from a previous deadlock detection), SKIP the stale
-      // check entirely and force this chunk through to the anchor/play path.
-      // This is the ONLY way to break the infinite stale loop when host and node clocks diverge.
-      if (this._forceNextChunkPlay) {
-        console.log(`[AudioPlayer] FORCE-PLAYING chunk #${chunk.seq} (timeUntilPlay=${timeUntilPlayMs.toFixed(0)}ms) to break stale deadlock. Re-anchoring NOW.`);
+      // [Sync v10] Phase 4: Graduated Recovery (Replacing hard stale-drop deadlock)
+      
+      const arrivalDrift = timeUntilPlayMs;
+      
+      // TIER 3: Clean Re-anchor (Drift > 500ms)
+      // Extreme drift: full reset but with a crossfade
+      if (arrivalDrift < -500 || this._forceNextChunkPlay) {
+        const reason = this._forceNextChunkPlay ? 'FORCE-PLAY' : 'CRITICAL DRIFT';
+        console.warn(`[AudioPlayer] Tier 3 Recovery (${reason}): ${arrivalDrift.toFixed(0)}ms. Crossfading to new anchor.`);
+        
         this._forceNextChunkPlay = false;
         this._consecutiveStaleDrops = 0;
-        // Force re-anchor: treat this chunk as the very first one
+        
+        // 1. Trigger fade-out in worklet
+        if (this.workletNode) {
+          this.workletNode.port.postMessage({ type: 'set_fade', payload: 0.0 });
+        }
+        
+        // 2. Re-anchor
         this.isFirstChunk = true;
         this.nextScheduledTime = 0;
         this.driftIntegral = 0;
-        // Fall through to the play path below — do NOT check stale
-      } else if (timeUntilPlayMs < staleThresholdMs) {
-        // Normal stale drop
+        
+        // 3. Briefly flush older chunks from jitter buffer but keep newest
+        if (this.jitterBuffer.size() > 5) {
+          for (let i = 0; i < this.jitterBuffer.size() - 5; i++) this.jitterBuffer.pop();
+        }
+
+        // 4. Trigger fade-in after a tiny delay (50ms)
+        setTimeout(() => {
+          if (this.workletNode) this.workletNode.port.postMessage({ type: 'set_fade', payload: 1.0 });
+        }, 50);
+
+        // Fall through to play path
+      } 
+      // TIER 2: Selective Skip (200ms - 500ms)
+      // Moderate drift: drop this chunk to close the gap, but don't reset everything
+      else if (arrivalDrift < -200) {
         this._consecutiveStaleDrops = (this._consecutiveStaleDrops || 0) + 1;
         
-        // [Sync v9.5] Reduced threshold from 30 to 15 (300ms) for faster recovery
-        if (this._consecutiveStaleDrops >= 15) {
-          console.warn(`[AudioPlayer] STALE DEADLOCK detected (${this._consecutiveStaleDrops} consecutive stale drops, last timeUntilPlay=${timeUntilPlayMs.toFixed(0)}ms). Will force-play next chunk.`);
-          
-          // Set the force flag — the VERY NEXT chunk that arrives will bypass stale check
-          this._forceNextChunkPlay = true;
-          this._consecutiveStaleDrops = 0;
-          
-          // Flush ALL remaining chunks from the buffer — they're all stale too.
-          // We want the NEXT fresh chunk from the network to be the one we anchor to.
-          while (this.jitterBuffer.size() > 0) {
-            this.jitterBuffer.pop();
-          }
-          
-          // Signal worklet to reset
-          if (this.workletNode) {
-            this.workletNode.port.postMessage({ type: 'stop' });
-            this.workletNode.port.postMessage({ type: 'start' });
-            this.updateWorkletClock();
-          }
-          
-          break; // Exit scheduler loop — wait for fresh chunk from network
+        if (this._consecutiveStaleDrops % 10 === 0) {
+          console.log(`[AudioPlayer] Tier 2 Recovery: Selective skip chunk #${chunk.seq} (drift: ${arrivalDrift.toFixed(0)}ms)`);
+        }
+        
+        if (this._consecutiveStaleDrops >= 25) {
+          this._forceNextChunkPlay = true; // Escalate to Tier 3
         }
         continue;
       }
+      // TIER 1: Accelerated Drain (50ms - 200ms)
+      // Minor drift: play the chunk but speed up slightly to catch up
+      else if (arrivalDrift < -50) {
+        if (this.chunksPlayed % 100 === 0) {
+          console.log(`[AudioPlayer] Tier 1 Recovery: Accelerated drain (drift: ${arrivalDrift.toFixed(0)}ms). Playback rate boosted.`);
+        }
+        // Force the PI controller to a higher speed temporarily
+        this.driftIntegral += (arrivalDrift / 10); // Artificial integral nudge
+      }
+
+      this._consecutiveStaleDrops = 0;
       
       // Chunk is valid (or force-played) — reset stale counter
       this._consecutiveStaleDrops = 0;
       
-      // [Sync v5.3] Restored Baseline Latency
-      // We subtract the reported outputLatency to provide a 'close-enough' baseline 
-      // immediately. AuraSync will then calibrate the REMAINING residual error.
+      // Standard calculation: now + (drift + calibration + deviceBuffer)
+      // deviceBuffer is our individual latency compensation from the server.
       let absolutePlayAt = now + 
-        ((timeUntilPlayMs - this.spatialDelayMs + this.calibrationOffsetMs) / 1000) - 
+        ((timeUntilPlayMs - this.spatialDelayMs + this.calibrationOffsetMs + this.deviceBuffer) / 1000) - 
         this.outputLatency;
 
       // [Sync v6.7] REMOVED Sample-Discrete Quantization

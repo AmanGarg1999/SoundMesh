@@ -233,7 +233,7 @@ class AudioCapture extends EventEmitter {
           if (abs > peak) peak = abs;
         }
         
-        if (this.sequenceNumber % 50 === 0) {
+        if (this.sequenceNumber % 250 === 0) {
           console.log(`[AudioCapture] Received chunk #${this.sequenceNumber} from worklet. Peak: ${peak.toFixed(4)}`);
         }
 

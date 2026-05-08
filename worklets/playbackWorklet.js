@@ -8,6 +8,8 @@ class PlaybackWorklet extends AudioWorkletProcessor {
     this.isPlaying = false;
     this.playbackRate = 1.0;
     this.actualRate = 1.0;
+    this.fadeGain = 1.0; // [Sync v10] Target fade gain
+    this.actualFadeGain = 1.0; // [Sync v10] Interpolated fade gain
     
     // Performance state
     this.currentChunk = null;
@@ -54,6 +56,8 @@ class PlaybackWorklet extends AudioWorkletProcessor {
         this.playbackRate = payload.playbackRate;
       } else if (type === 'set_rate') {
         this.playbackRate = payload;
+      } else if (type === 'set_fade') {
+        this.fadeGain = payload;
       } else if (type === 'start') {
         this.isPlaying = true;
       } else if (type === 'stop') {
@@ -122,8 +126,11 @@ class PlaybackWorklet extends AudioWorkletProcessor {
       for (let i = 0; i < frameCount; i++) {
           // 1. Smoothly interpolate playback rate (Exp-Lerp)
           this.actualRate = (this.actualRate * 0.999) + (this.playbackRate * 0.001);
+          
+          // 2. Smoothly interpolate fade gain (Phase 4)
+          this.actualFadeGain = (this.actualFadeGain * 0.99) + (this.fadeGain * 0.01);
 
-          // 2. Sample Alignment Logic
+          // 3. Sample Alignment Logic
           // We find the chunk that contains the currentSampleSharedTime
           while (this.buffer.length > 0) {
               const chunk = this.buffer[0];
@@ -158,12 +165,12 @@ class PlaybackWorklet extends AudioWorkletProcessor {
                 // Left channel
                 const l0 = this.currentChunk.data[dataIdx];
                 const l1 = this.currentChunk.data[nextIdx];
-                left[i] = l0 + frac * (l1 - l0);
+                left[i] = (l0 + frac * (l1 - l0)) * this.actualFadeGain;
 
                 // Right channel
                 const r0 = this.currentChunk.data[dataIdx + 1];
                 const r1 = this.currentChunk.data[nextIdx + 1];
-                right[i] = r0 + frac * (r1 - r0);
+                right[i] = (r0 + frac * (r1 - r0)) * this.actualFadeGain;
               } else if (dataIdx >= 0 && dataIdx + 1 < this.currentChunk.data.length) {
                 left[i] = this.currentChunk.data[dataIdx];
                 right[i] = this.currentChunk.data[dataIdx + 1];
@@ -171,6 +178,9 @@ class PlaybackWorklet extends AudioWorkletProcessor {
                 left[i] = 0;
                 right[i] = 0;
               }
+
+              // [Sync v10] CRITICAL FIX: Increment shared time for next sample
+              currentSampleSharedTime += msPerSample * this.actualRate;
           } else {
               // Starvation/Waiting
               left[i] = 0;

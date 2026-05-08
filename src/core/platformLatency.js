@@ -13,6 +13,7 @@ export class PlatformLatency extends EventEmitter {
     this.isCalibrated = false;
     this.lastCalibrationTime = 0;
     this.isBluetooth = false;
+    this.calibrationConfidence = 0; // [Sync v10] 0.0 to 1.0
   }
 
   /**
@@ -162,12 +163,100 @@ export class PlatformLatency extends EventEmitter {
   }
 
   /**
-   * Measure round-trip latency (placeholder for future logic)
+   * Measure round-trip latency using a chirp signal and microphone loopback.
+   * [Sync v10] Real implementation for universal robustness.
    */
   async measureRoundTrip(audioContext) {
-    // In a real scenario, this would play a chirp and listen via mic.
-    // For now, we return the baseline to avoid blocking.
-    return 100; 
+    console.log('[PlatformLatency] Requesting microphone for acoustic calibration...');
+    
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: { 
+          echoCancellation: false, 
+          noiseSuppression: false,
+          autoGainControl: false
+        } 
+      });
+    } catch (e) {
+      console.warn('[PlatformLatency] Microphone access denied. Using heuristic only.');
+      this.calibrationConfidence = 0.2; // Low confidence
+      return 100; // Default fallback
+    }
+
+    const durationS = 0.5; // 500ms recording
+    const sampleRate = audioContext.sampleRate;
+    const bufferSize = sampleRate * durationS;
+    
+    // 1. Prepare chirp signal (1kHz sine burst)
+    const osc = audioContext.createOscillator();
+    const chirpGain = audioContext.createGain();
+    osc.frequency.setValueAtTime(1000, audioContext.currentTime);
+    chirpGain.gain.setValueAtTime(0, audioContext.currentTime);
+    chirpGain.gain.linearRampToValueAtTime(0.8, audioContext.currentTime + 0.01);
+    chirpGain.gain.setValueAtTime(0.8, audioContext.currentTime + 0.06);
+    chirpGain.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.07);
+    
+    osc.connect(chirpGain);
+    chirpGain.connect(audioContext.destination);
+
+    // 2. Prepare recording
+    const recorder = audioContext.createMediaStreamSource(stream);
+    const processor = audioContext.createScriptProcessor(2048, 1, 1);
+    const recordedSamples = new Float32Array(bufferSize);
+    let offset = 0;
+
+    const recordingPromise = new Promise((resolve) => {
+      processor.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0);
+        if (offset < bufferSize) {
+          recordedSamples.set(input.slice(0, bufferSize - offset), offset);
+          offset += input.length;
+        } else {
+          resolve();
+        }
+      };
+    });
+
+    recorder.connect(processor);
+    processor.connect(audioContext.destination); // Required for script processor to run
+
+    // 3. Fire!
+    const startTime = audioContext.currentTime;
+    osc.start(startTime);
+    osc.stop(startTime + 0.1);
+
+    await recordingPromise;
+
+    // 4. Cleanup
+    osc.disconnect();
+    chirpGain.disconnect();
+    recorder.disconnect();
+    processor.disconnect();
+    stream.getTracks().forEach(t => t.stop());
+
+    // 5. Analyze: Find the first peak above threshold
+    // We look for the 1kHz signature
+    let peakIndex = -1;
+    const threshold = 0.15;
+    for (let i = 0; i < recordedSamples.length; i++) {
+      if (Math.abs(recordedSamples[i]) > threshold) {
+        peakIndex = i;
+        break;
+      }
+    }
+
+    if (peakIndex === -1) {
+      console.warn('[PlatformLatency] Calibration failed: No chirp detected in recording.');
+      this.calibrationConfidence = 0.1;
+      return 100;
+    }
+
+    const roundTripMs = (peakIndex / sampleRate) * 1000;
+    console.log(`[PlatformLatency] Measured round-trip: ${roundTripMs.toFixed(1)}ms`);
+    
+    this.calibrationConfidence = 0.9; // High confidence
+    return roundTripMs;
   }
 
   /**

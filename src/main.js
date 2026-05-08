@@ -91,9 +91,22 @@ function init() {
       Object.assign(appState.devices[idx], device);
     }
 
-    // [Sync v6.0] Initiate WebRTC connection if we are the host
+    // [Sync v10] Phase 6: Mesh Topology
+    // Host connects to everyone
     if (appState.role === 'host') {
       webrtcManager.initConnection(device.deviceId);
+    } 
+    // Nodes connect to the Host (always) AND a subset of other nodes for relay
+    else if (appState.role === 'node' && device.role === 'node' && device.deviceId !== appState.deviceId) {
+      const myNodes = appState.devices.filter(d => d.role === 'node');
+      const myIndex = myNodes.findIndex(d => d.deviceId === appState.deviceId);
+      const targetIndex = myNodes.findIndex(d => d.deviceId === device.deviceId);
+      
+      // Simplified Ring-Mesh: Every node connects to its logical neighbors in the array
+      if (Math.abs(myIndex - targetIndex) <= 2) {
+        console.log(`[App] Mesh Relay: Initiating connection to neighbor node ${device.deviceId}`);
+        webrtcManager.initConnection(device.deviceId);
+      }
     }
 
     refreshUI();

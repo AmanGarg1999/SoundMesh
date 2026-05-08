@@ -111,7 +111,8 @@ class ClockSync extends EventEmitter {
       convergenceProgress,
       readyToPlay,
       convergenceStatus,
-      recommendedGlobalBuffer 
+      recommendedGlobalBuffer,
+      deviceBuffer: serverDeviceBuffer
     } = payload;
 
     // Fallback to old format for backward compatibility
@@ -222,6 +223,7 @@ class ClockSync extends EventEmitter {
       rtt: avgRtt,
       status: this.syncStatus,
       globalBuffer: this.globalBuffer,
+      deviceBuffer: serverDeviceBuffer || 0, // [Sync v10]
       isConverged: this._isConverged,
       convergenceProgress: convergenceProgress || 0,
       readyToPlay: readyToPlay || false,

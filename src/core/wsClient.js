@@ -52,6 +52,10 @@ class WSClient extends EventEmitter {
         roleIntent: roleIntent,
         name: localStorage.getItem('soundmesh_device_name'),
         pin: localStorage.getItem('soundmesh_pin') || null,
+        capabilities: {
+          supportsOpus: !!window.AudioDecoder,
+          supportsWebRTC: !!window.RTCPeerConnection
+        }
       });
     };
 
